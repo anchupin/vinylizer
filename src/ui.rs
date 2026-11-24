@@ -86,6 +86,7 @@ struct AuRow {
 struct Controls {
     status: Id,
     enabled: Id,
+    idle: Id,
     preset: Id,
     preset_save: Id,
     preset_delete: Id,
@@ -104,6 +105,7 @@ impl Default for Controls {
         Self {
             status: null,
             enabled: null,
+            idle: null,
             preset: null,
             preset_save: null,
             preset_delete: null,
@@ -836,6 +838,21 @@ impl Ui {
         };
         let seg = segmented(&["Vinylizer", "Сторонний плагин"], mode, c, c"selectMode:");
         r.field("Режим", seg, W - FIELD_X - PAD);
+
+        let idle = checkbox(
+            "Треск без музыки",
+            self.pipe.params.idle_surface.load(Relaxed),
+            c,
+            c"toggleIdleSurface:",
+        );
+        set_tooltip(
+            idle,
+            "Пластинка крутится и в тишине: треск и шум не затихают на паузе. \
+             Работает, пока есть звуковой маршрут: «Все приложения» или открытое выбранное приложение.",
+        );
+        r.put(idle, FIELD_X, 0.0, W - FIELD_X - PAD, 18.0);
+        self.c.idle = idle;
+        r.y += 24.0;
         r.rule();
     }
 
@@ -1353,6 +1370,16 @@ extern "C" fn on_select_effect(_: Id, _: Sel, sender: Id) {
     });
 }
 
+extern "C" fn on_toggle_idle_surface(_: Id, _: Sel, sender: Id) {
+    let on = unsafe { send!(sender, "state"; -> isize) } != 0;
+    log(&format!("idle surface: {on}"));
+    with_ui(|ui| {
+        ui.pipe.params.idle_surface.store(on, Relaxed);
+        // Starts or stops the needle-on-its-own path on the output device.
+        ui.apply();
+    });
+}
+
 extern "C" fn on_toggle_bypass(_: Id, _: Sel, sender: Id) {
     let on = unsafe { send!(sender, "state"; -> isize) } != 0;
     with_ui(|ui| ui.pipe.params.bypass.store(on, Relaxed));
@@ -1758,6 +1785,7 @@ unsafe fn make_controller() -> Id {
         (c"selectMode:", on_select_mode),
         (c"selectEffect:", on_select_effect),
         (c"toggleBypass:", on_toggle_bypass),
+        (c"toggleIdleSurface:", on_toggle_idle_surface),
         (c"selectPreset:", on_select_preset),
         (c"saveBuiltinPreset:", on_save_builtin_preset),
         (c"saveBuiltinPresetAs:", on_save_builtin_preset_as),

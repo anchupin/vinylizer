@@ -5,9 +5,10 @@
 //! window and its settings survive route rebuilds (device switch, app restart).
 
 use crate::au::AuPlugin;
-use crate::engine::{io_proc, Engine, Meter};
+use crate::engine::{idle_io_proc, io_proc, Engine, IdleEngine, Meter};
 use crate::ffi::kAudioObjectPropertyScopeInput;
 use crate::hal::{self, Aggregate, Device, IoProc, Result, Tap, TapTarget};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use vinylizer::params::Params;
 use vinylizer::settings::{au_state_file, Settings};
@@ -37,11 +38,46 @@ impl Drop for Route {
     }
 }
 
+/// The needle playing on its own on the output device (see `IdleEngine`).
+struct IdleRoute {
+    io: Option<IoProc>,
+    engine: *mut IdleEngine,
+}
+
+impl Drop for IdleRoute {
+    fn drop(&mut self) {
+        // Stop the IOProc before freeing the engine it points to.
+        drop(self.io.take());
+        if !self.engine.is_null() {
+            drop(unsafe { Box::from_raw(self.engine) });
+        }
+    }
+}
+
+impl IdleRoute {
+    fn start(params: Arc<Params>, meter: Arc<Meter>, out: &Device) -> Result<IdleRoute> {
+        let sample_rate = hal::sample_rate(out.id)?;
+        let engine = Box::into_raw(Box::new(IdleEngine::new(params, meter, sample_rate)));
+        let mut route = IdleRoute { io: None, engine };
+
+        let mut io = IoProc::new(out.id, idle_io_proc, engine as *mut _)?;
+        // Output only: an open microphone would drop a Bluetooth speaker into HFP.
+        let inputs = hal::stream_count(out.id, kAudioObjectPropertyScopeInput);
+        if inputs > 0 {
+            let _ = io.restrict_input_streams(inputs, 0);
+        }
+        io.start()?;
+        route.io = Some(io);
+        Ok(route)
+    }
+}
+
 pub struct Pipeline {
     pub params: Arc<Params>,
     pub meter: Arc<Meter>,
     au: Option<Box<AuPlugin>>,
     route: Option<Route>,
+    idle: Option<IdleRoute>,
     pub status: String,
 }
 
@@ -63,6 +99,7 @@ impl Pipeline {
             meter: Arc::new(Meter::default()),
             au: None,
             route: None,
+            idle: None,
             status: "Выключено".into(),
         }
     }
@@ -77,6 +114,20 @@ impl Pipeline {
 
     pub fn stop(&mut self) {
         self.route = None;
+        self.idle = None;
+    }
+
+    /// Start the needle-on-its-own path when it is wanted: built-in effect, and
+    /// "crackle without music" on. A third-party plugin cannot run in two places at once.
+    fn start_idle(&mut self, cfg: &Settings, out: &Device) {
+        if cfg.active_au().is_some() || !self.params.idle_surface.load(Relaxed) {
+            return;
+        }
+
+        match IdleRoute::start(self.params.clone(), self.meter.clone(), out) {
+            Ok(r) => self.idle = Some(r),
+            Err(e) => vinylizer::settings::log(&format!("idle needle failed: {e}")),
+        }
     }
 
     /// Persist the current plugin's state next to the settings.
@@ -143,6 +194,7 @@ impl Pipeline {
                     hal::sample_rate(out.id).unwrap_or(48_000.0),
                 )?;
                 self.status = "Ждём, пока выбранные приложения заиграют…".into();
+                self.start_idle(cfg, &out);
                 return Ok(());
             }
             (TapTarget::Processes(objs.clone()), objs)
@@ -185,7 +237,11 @@ impl Pipeline {
         }
         io.start()?;
         route.io = Some(io);
+        let out = route.out.clone();
+        self.route = Some(route);
+        self.start_idle(cfg, &out);
 
+        let route = self.route.as_ref().unwrap();
         let fx = match &self.au {
             Some(a) if cfg.chain => format!("{} + Vinylizer", a.name),
             Some(a) => a.name.clone(),
@@ -197,7 +253,6 @@ impl Pipeline {
             route.sample_rate / 1000.0,
             route.buffer
         );
-        self.route = Some(route);
         Ok(())
     }
 

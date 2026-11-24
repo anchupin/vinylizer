@@ -33,6 +33,7 @@ CLI OPTIONS:
                        rpm 0=33⅓ 1=45 2=78)
   --au <name>          host an Audio Unit effect instead of the built-in DSP (e.g. \"Vinyl\")
   --chain              with --au: run the built-in DSP after the AU as well
+  --idle               keep crackle and noise going while nothing plays
   --list-devices       list output devices
   --list-apps          list processes known to Core Audio
   --list-plugins       list installed AU effects
@@ -75,6 +76,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
                 cfg.mode = vinylizer::settings::Mode::Plugin;
             }
             "--chain" => cfg.chain = true,
+            "--idle" => params.idle_surface.store(true, Relaxed),
             "--set" => {
                 let s = val("--set")?;
                 let (k, v) = s.split_once('=').ok_or("--set expects key=value")?;
@@ -193,10 +195,11 @@ fn console(params: Arc<Params>, meter: Arc<crate::engine::Meter>, au: Option<au:
             ["meter"] => {
                 let db = |x: f32| if x > 0.0 { 20.0 * x.log10() } else { -120.0 };
                 println!(
-                    "  in {:>6.1} dBFS   out {:>6.1} dBFS   callbacks {}",
+                    "  in {:>6.1} dBFS   out {:>6.1} dBFS   callbacks {}   frames {}",
                     db(meter.in_peak.take()),
                     db(meter.out_peak.take()),
-                    meter.callbacks.load(Relaxed)
+                    meter.callbacks.load(Relaxed),
+                    meter.frames.load(Relaxed)
                 );
                 Ok(())
             }

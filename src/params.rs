@@ -46,6 +46,8 @@ pub struct Params {
     pub gain: AtomicF32,    // output gain, linear (0..2)
     pub rpm: AtomicF32,     // turntable speed index into `RPM_LABELS` (0..2)
     pub bypass: AtomicBool,
+    /// Keep crackle and noise going while nothing plays (otherwise they fade out after a pause).
+    pub idle_surface: AtomicBool,
     version: AtomicU32,
 }
 
@@ -74,27 +76,29 @@ pub const RPM_LABELS: &[&str] = &["33⅓ об/мин", "45 об/мин", "78 о�
 /// What "reset" returns the built-in effect to.
 pub const DEFAULT_PRESET: &str = "warm";
 
-/// Peak level of the loud dust ticks, dBFS, for a `crackle_level` of 0..1 (−40 to −6 dBFS).
+/// Peak level of the loud dust ticks, dBFS, for a `crackle_level` of 0..1 (−40 to 0 dBFS).
+/// Ticks are a fraction of a millisecond long, so even 0 dBFS sounds quieter than music at
+/// that level; the output limiter keeps anything louder from clipping.
 pub fn crackle_peak_db(level: f32) -> f32 {
-    -40.0 + 34.0 * level
+    -40.0 + 40.0 * level
 }
 
 pub const PRESETS: &[(&str, &str, [f32; 11])] = &[
     //                                  wet   age   dust  scrat level wow   noise drive width gain rpm
     // crackle level: new −30, subtle −26, warm −22, single/jazz −20, worn −16, jazz78 −14, shellac −12 dBFS
-    ("new", "Новая пластинка", [1.0, 0.15, 0.08, 0.00, 0.29, 0.10, 0.15, 0.20, 0.95, 1.0, 0.0]),
-    ("subtle", "Чуть-чуть", [1.0, 0.30, 0.15, 0.05, 0.41, 0.15, 0.20, 0.25, 0.90, 1.0, 0.0]),
-    ("warm", "Тёплая", [1.0, 0.45, 0.25, 0.15, 0.53, 0.25, 0.30, 0.35, 0.85, 1.0, 0.0]),
-    ("worn", "Заигранная", [1.0, 0.60, 0.60, 0.45, 0.71, 0.40, 0.50, 0.50, 0.80, 1.0, 0.0]),
-    ("single", "Сингл 45", [1.0, 0.35, 0.30, 0.20, 0.59, 0.20, 0.25, 0.40, 0.85, 1.0, 1.0]),
-    ("shellac", "Шеллак 78", [1.0, 0.95, 0.80, 0.50, 0.82, 0.50, 0.70, 0.60, 0.00, 1.1, 2.0]),
+    ("new", "Новая пластинка", [1.0, 0.15, 0.08, 0.00, 0.25, 0.10, 0.15, 0.20, 0.95, 1.0, 0.0]),
+    ("subtle", "Чуть-чуть", [1.0, 0.30, 0.15, 0.05, 0.35, 0.15, 0.20, 0.25, 0.90, 1.0, 0.0]),
+    ("warm", "Тёплая", [1.0, 0.45, 0.25, 0.15, 0.45, 0.25, 0.30, 0.35, 0.85, 1.0, 0.0]),
+    ("worn", "Заигранная", [1.0, 0.60, 0.60, 0.45, 0.60, 0.40, 0.50, 0.50, 0.80, 1.0, 0.0]),
+    ("single", "Сингл 45", [1.0, 0.35, 0.30, 0.20, 0.50, 0.20, 0.25, 0.40, 0.85, 1.0, 1.0]),
+    ("shellac", "Шеллак 78", [1.0, 0.95, 0.80, 0.50, 0.70, 0.50, 0.70, 0.60, 0.00, 1.1, 2.0]),
     // Derived from the user's iZotope Vinyl presets (Year / Wear / Dust / Scratch / Warp / Noise / Mono):
     // Jazz: 1950s, wear 25 %, dust 40 % loud, light scratches, no warp, quiet motor, stereo
-    ("jazz", "Джаз 50-х", [1.0, 0.40, 0.30, 0.10, 0.59, 0.05, 0.20, 0.25, 0.90, 1.0, 0.0]),
+    ("jazz", "Джаз 50-х", [1.0, 0.40, 0.30, 0.10, 0.50, 0.05, 0.20, 0.25, 0.90, 1.0, 0.0]),
     // Sinatra 50s: 1950s, wear 30 %, softer dust, a touch more motor noise
-    ("sinatra", "Синатра 50-х", [1.0, 0.45, 0.22, 0.10, 0.53, 0.05, 0.25, 0.30, 0.85, 1.0, 0.0]),
+    ("sinatra", "Синатра 50-х", [1.0, 0.45, 0.22, 0.10, 0.45, 0.05, 0.25, 0.30, 0.85, 1.0, 0.0]),
     // Old 78 Jazz: 1930s 78 rpm, wear 40 %, dust 50 %, more scratches, slight warp, mono
-    ("jazz78", "Старый джаз 78", [1.0, 0.90, 0.50, 0.35, 0.76, 0.15, 0.50, 0.45, 0.00, 1.05, 2.0]),
+    ("jazz78", "Старый джаз 78", [1.0, 0.90, 0.50, 0.35, 0.65, 0.15, 0.50, 0.45, 0.00, 1.05, 2.0]),
 ];
 
 impl Params {
@@ -112,6 +116,7 @@ impl Params {
             gain: AtomicF32::new(1.0),
             rpm: AtomicF32::new(0.0),
             bypass: AtomicBool::new(false),
+            idle_surface: AtomicBool::new(false),
             version: AtomicU32::new(1),
         };
         p.apply_preset(DEFAULT_PRESET).expect("built-in preset");

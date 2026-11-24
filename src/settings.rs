@@ -2,6 +2,7 @@
 
 use crate::params::{Params, PARAM_NAMES};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Which effect processes the audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +139,7 @@ impl Settings {
             let (k, v) = (k.trim(), v.trim());
             match k {
                 "enabled" => s.enabled = v == "1",
+                "idle_surface" => params.idle_surface.store(v == "1", Relaxed),
                 "chain" => s.chain = v == "1",
                 "mode" => {
                     mode = match v {
@@ -189,6 +191,10 @@ impl Settings {
             self.preset.as_deref().unwrap_or(""),
             self.targets.join(",")
         );
+        out.push_str(&format!(
+            "idle_surface={}\n",
+            params.idle_surface.load(Relaxed) as u8
+        ));
         out.push_str(&param_lines(params));
         out
     }
@@ -230,6 +236,11 @@ mod tests {
         assert_eq!(s, s2);
         assert!((p2.get("crackle").unwrap() - 0.42).abs() < 1e-6);
         assert_eq!(s2.active_au(), None, "plugin is remembered but not active");
+
+        p.idle_surface.store(true, Relaxed);
+        let p3 = Params::new();
+        Settings::parse(&s.serialize(&p), &p3);
+        assert!(p3.idle_surface.load(Relaxed));
     }
 
     #[test]

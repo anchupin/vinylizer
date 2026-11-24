@@ -294,6 +294,8 @@ pub struct Vinyl {
     noise_mid: NoiseShaper,
     noise_side: NoiseShaper,
     noise_lvl: f32,
+    /// Gain on crackle and groove noise, set per sample by a `SilenceGate`.
+    surface: f32,
 }
 
 impl Vinyl {
@@ -340,6 +342,7 @@ impl Vinyl {
             noise_mid: NoiseShaper::default(),
             noise_side: NoiseShaper::default(),
             noise_lvl: 0.0,
+            surface: 1.0,
         };
         v.noise_mid.set(fs);
         v.noise_side.set(fs);
@@ -684,13 +687,13 @@ impl Vinyl {
         // --- surface
         if p.crackle > 0.0 || p.scratches > 0.0 {
             let (cl, cr) = self.crackle(prev);
-            wl += cl;
-            wr += cr;
+            wl += cl * self.surface;
+            wr += cr * self.surface;
         }
         if p.noise > 0.0 {
             let (nl, nr) = self.groove_noise();
-            wl += nl;
-            wr += nr;
+            wl += nl * self.surface;
+            wr += nr * self.surface;
         }
 
         self.w = (w + 1) & DELAY_MASK;
@@ -701,6 +704,66 @@ impl Vinyl {
     /// Latency introduced by the effect, in samples.
     pub fn latency(&self) -> usize {
         self.base_delay as usize
+    }
+
+    /// Gain on the generated crackle and noise (0..1); the music itself is not affected.
+    #[inline(always)]
+    pub fn set_surface(&mut self, gain: f32) {
+        self.surface = gain;
+    }
+}
+
+/// Input quieter than this counts as silence (−70 dBFS).
+const SILENCE: f32 = 3.2e-4;
+
+/// Lifts the needle when the music stops: after `HOLD_S` of silent input the generated
+/// surface fades out, and it fades back in as soon as audio returns. Shorter gaps, like
+/// the pause between tracks, keep their crackle, as on a record.
+pub struct SilenceGate {
+    silent: u32,
+    hold: u32,
+    gain: f32,
+    open: f32,
+    close: f32,
+}
+
+impl SilenceGate {
+    const HOLD_S: f64 = 3.0;
+    const OPEN_S: f64 = 0.02;
+    const CLOSE_S: f64 = 0.4;
+
+    /// Starts closed: nothing is generated until something plays.
+    pub fn new(sample_rate: f64) -> Self {
+        let coef = |secs: f64| (1.0 - (-1.0 / (secs * sample_rate)).exp()) as f32;
+        let hold = (Self::HOLD_S * sample_rate) as u32;
+        Self {
+            silent: hold + 1,
+            hold,
+            gain: 0.0,
+            open: coef(Self::OPEN_S),
+            close: coef(Self::CLOSE_S),
+        }
+    }
+
+    /// Feed one input frame; returns the surface gain for it.
+    #[inline(always)]
+    pub fn tick(&mut self, l: f32, r: f32) -> f32 {
+        if l.abs().max(r.abs()) > SILENCE {
+            self.silent = 0;
+        } else {
+            self.silent = self.silent.saturating_add(1);
+        }
+
+        let (target, k) = if self.silent > self.hold {
+            (0.0, self.close)
+        } else {
+            (1.0, self.open)
+        };
+        self.gain += (target - self.gain) * k;
+        if (target - self.gain).abs() < 1.0e-5 {
+            self.gain = target;
+        }
+        self.gain
     }
 }
 
@@ -1020,6 +1083,41 @@ mod tests {
         for (q, l) in quiet.iter().zip(&loud) {
             assert!((q.0 * k - l.0).abs() <= 1e-4 + 1e-3 * l.0.abs(), "{} vs {}", q.0 * k, l.0);
         }
+    }
+
+    /// Gate gain after feeding `secs` of a constant input level.
+    fn feed(g: &mut SilenceGate, secs: f32, level: f32) -> f32 {
+        let mut gain = 0.0;
+        for _ in 0..(secs * 48_000.0) as usize {
+            gain = g.tick(level, -level);
+        }
+        gain
+    }
+
+    #[test]
+    fn silence_gate_lifts_the_needle_only_after_a_real_stop() {
+        let mut g = SilenceGate::new(48_000.0);
+        assert_eq!(feed(&mut g, 0.5, 0.0), 0.0, "nothing generated before anything plays");
+
+        assert!(feed(&mut g, 0.1, 0.3) > 0.99, "opens right away when music starts");
+        assert!(feed(&mut g, 2.0, 0.0) > 0.99, "a gap between tracks keeps the crackle");
+        assert!(feed(&mut g, 0.5, 0.001) > 0.99, "a quiet passage (-60 dBFS) counts as music");
+        assert!(feed(&mut g, 5.0, 0.0) < 0.01, "a pause fades the surface out");
+        assert_eq!(feed(&mut g, 3.0, 0.0), 0.0, "and then mutes it completely");
+    }
+
+    #[test]
+    fn surface_gain_mutes_crackle_and_noise_but_not_music() {
+        let fs = 48_000.0;
+        let mut v = Vinyl::new(fs as f64);
+        v.update(&clean(&[("crackle", 1.0), ("scratches", 1.0), ("noise", 1.0)]));
+        v.set_surface(0.0);
+        let silent = run(&mut v, 48_000, |_| 0.0);
+        // Only the filters' anti-denormal offset (~1e-18) is left.
+        assert!(silent.iter().all(|(l, r)| l.abs() < 1e-9 && r.abs() < 1e-9));
+
+        let music = run(&mut v, 48_000, |i| (TAU * 1_000.0 * i as f32 / fs).sin() * 0.5);
+        assert!(rms(music[24_000..].iter().map(|s| s.0)) > 0.3);
     }
 
     #[test]
