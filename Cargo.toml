@@ -1,0 +1,26 @@
+[package]
+name = "vinylizer"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time vinyl emulation for macOS system audio (Core Audio process taps + AU hosting)"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vinylizer"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"   # never unwind across the Core Audio IOProc boundary
+debug = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(vinyl_check)'] }
