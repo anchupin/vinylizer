@@ -10,6 +10,7 @@ use crate::ffi::kAudioObjectPropertyScopeInput;
 use crate::hal::{self, Aggregate, Device, IoProc, Result, Tap, TapTarget};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use vinylizer::i18n::Lang;
 use vinylizer::params::Params;
 use vinylizer::settings::{au_state_file, Settings};
 
@@ -72,13 +73,52 @@ impl IdleRoute {
     }
 }
 
+/// What the pipeline is doing, for the status line; `text` renders it in a language.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Status {
+    Off,
+    /// Selected apps are not running yet.
+    Waiting,
+    Error(String),
+    Running {
+        effect: String,
+        device: String,
+        sample_rate: f64,
+        buffer: u32,
+    },
+}
+
+impl Status {
+    pub fn text(&self, lang: Lang) -> String {
+        match self {
+            Status::Off => lang.pick("Выключено", "Off").into(),
+            Status::Waiting => lang
+                .pick(
+                    "Ждём, пока выбранные приложения заиграют…",
+                    "Waiting for the selected apps to play…",
+                )
+                .into(),
+            Status::Error(e) => format!("{}: {e}", lang.pick("Ошибка", "Error")),
+            Status::Running {
+                effect,
+                device,
+                sample_rate,
+                buffer,
+            } => format!(
+                "{effect} → {device} · {:.0} kHz · {buffer} fr",
+                sample_rate / 1000.0
+            ),
+        }
+    }
+}
+
 pub struct Pipeline {
     pub params: Arc<Params>,
     pub meter: Arc<Meter>,
     au: Option<Box<AuPlugin>>,
     route: Option<Route>,
     idle: Option<IdleRoute>,
-    pub status: String,
+    pub status: Status,
 }
 
 /// Processes whose bundle id starts with one of the targets.
@@ -100,7 +140,7 @@ impl Pipeline {
             au: None,
             route: None,
             idle: None,
-            status: "Выключено".into(),
+            status: Status::Off,
         }
     }
 
@@ -169,14 +209,14 @@ impl Pipeline {
         self.stop();
         let r = self.apply_inner(cfg);
         if let Err(e) = &r {
-            self.status = format!("Ошибка: {e}");
+            self.status = Status::Error(e.to_string());
         }
         r
     }
 
     fn apply_inner(&mut self, cfg: &Settings) -> Result<()> {
         if !cfg.enabled {
-            self.status = "Выключено".into();
+            self.status = Status::Off;
             return Ok(());
         }
         let out = hal::default_output()?;
@@ -193,7 +233,7 @@ impl Pipeline {
                     cfg.active_au(),
                     hal::sample_rate(out.id).unwrap_or(48_000.0),
                 )?;
-                self.status = "Ждём, пока выбранные приложения заиграют…".into();
+                self.status = Status::Waiting;
                 self.start_idle(cfg, &out);
                 return Ok(());
             }
@@ -242,17 +282,17 @@ impl Pipeline {
         self.start_idle(cfg, &out);
 
         let route = self.route.as_ref().unwrap();
-        let fx = match &self.au {
+        let effect = match &self.au {
             Some(a) if cfg.chain => format!("{} + Vinylizer", a.name),
             Some(a) => a.name.clone(),
             None => "Vinylizer".into(),
         };
-        self.status = format!(
-            "{fx} → {} · {:.0} kHz · {} fr",
-            route.out.name,
-            route.sample_rate / 1000.0,
-            route.buffer
-        );
+        self.status = Status::Running {
+            effect,
+            device: route.out.name.clone(),
+            sample_rate: route.sample_rate,
+            buffer: route.buffer,
+        };
         Ok(())
     }
 

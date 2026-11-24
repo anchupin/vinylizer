@@ -1,5 +1,6 @@
 //! Persistent user settings (simple `key=value` text file).
 
+use crate::i18n::Lang;
 use crate::params::{Params, PARAM_NAMES};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -27,6 +28,8 @@ pub struct Settings {
     pub au_preset: Option<String>,
     /// The user's own built-in preset last loaded or saved; "Save" overwrites it.
     pub preset: Option<String>,
+    /// Interface language; `None` follows the system language.
+    pub lang: Option<Lang>,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
             chain: false,
             au_preset: None,
             preset: None,
+            lang: None,
         }
     }
 }
@@ -109,6 +113,23 @@ fn apply_param_lines(text: &str, params: &Params) {
             }
         }
     }
+
+    // Written before crackle and clicks were split: "crackle" meant both, and its level was set
+    // for the loud clicks. Keep that loudness for clicks and put the fine crackle 8 dB under it.
+    let has = |key: &str| {
+        text.lines()
+            .any(|l| l.split_once('=').is_some_and(|(k, _)| k.trim() == key))
+    };
+    if has("crackle") && !has("clicks") {
+        // The old pops came at 0.4·crackle per second; clicks come at clicks^1.5 · 3 per second.
+        let pops_per_s = 0.4 * params.crackle.get();
+        let _ = params.set("clicks", (pops_per_s / 3.0).powf(2.0 / 3.0));
+        if has("crackle_level") {
+            // Ticks keep their level; pops were 0..6 dB above it, clicks 0..6 dB below theirs.
+            let lvl = params.crackle_level.get();
+            let _ = params.set("click_level", (lvl + 0.15).min(1.0));
+        }
+    }
 }
 
 /// File name for a plugin's saved state, derived from its display name.
@@ -151,6 +172,7 @@ impl Settings {
                 "au" => s.au = (!v.is_empty()).then(|| v.to_string()),
                 "au_preset" => s.au_preset = (!v.is_empty()).then(|| v.to_string()),
                 "preset" => s.preset = (!v.is_empty()).then(|| v.to_string()),
+                "lang" => s.lang = Lang::from_code(v),
                 "targets" => {
                     s.targets = v
                         .split(',')
@@ -159,14 +181,10 @@ impl Settings {
                         .map(String::from)
                         .collect()
                 }
-                _ if PARAM_NAMES.contains(&k) => {
-                    if let Ok(x) = v.parse::<f32>() {
-                        let _ = params.set(k, x);
-                    }
-                }
                 _ => {}
             }
         }
+        apply_param_lines(text, params);
 
         // Files written before modes existed: a saved plugin meant plugin mode.
         s.mode = mode.unwrap_or(if s.au.is_some() {
@@ -179,8 +197,9 @@ impl Settings {
 
     pub fn serialize(&self, params: &Params) -> String {
         let mut out = format!(
-            "enabled={}\nmode={}\nchain={}\nau={}\nau_preset={}\npreset={}\ntargets={}\n",
+            "enabled={}\nlang={}\nmode={}\nchain={}\nau={}\nau_preset={}\npreset={}\ntargets={}\n",
             self.enabled as u8,
+            self.lang.map_or("", Lang::code),
             match self.mode {
                 Mode::Builtin => "builtin",
                 Mode::Plugin => "plugin",
@@ -229,6 +248,7 @@ mod tests {
             chain: true,
             au_preset: Some("Jazz".into()),
             preset: Some("Пыльная 45".into()),
+            lang: Some(Lang::En),
         };
         let text = s.serialize(&p);
         let p2 = Params::new();
@@ -262,6 +282,25 @@ mod tests {
         q.apply_values(&list[0].1);
         assert!(q.matches(&p.values()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_from_before_the_crackle_split_sound_the_same() {
+        let p = Params::new();
+        Settings::parse("crackle=0.5\ncrackle_level=0.7\n", &p);
+
+        // 0.2 pops/s became clicks at the same rate: 0.164^1.5 · 3 ≈ 0.2.
+        assert!((p.clicks.get().powf(1.5) * 3.0 - 0.2).abs() < 0.005);
+        // Pops were 0..6 dB above the old level; clicks sit 0..6 dB below theirs.
+        assert!((p.click_level.get() - 0.85).abs() < 1e-6);
+        // Ticks are unchanged.
+        assert!((p.crackle_level.get() - 0.7).abs() < 1e-6);
+
+        // New files are taken as they are.
+        let q = Params::new();
+        Settings::parse("crackle=0.5\ncrackle_level=0.9\nclicks=0.1\nclick_level=0.2\n", &q);
+        assert!((q.crackle_level.get() - 0.9).abs() < 1e-6);
+        assert!((q.click_level.get() - 0.2).abs() < 1e-6);
     }
 
     #[test]

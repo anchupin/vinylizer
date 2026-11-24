@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vinylizer::i18n::Lang;
 use vinylizer::params::{Params, PARAM_NAMES, PRESETS};
 use vinylizer::settings::Settings;
 
@@ -29,7 +30,8 @@ CLI OPTIONS:
   --preset <name>      built-in preset: new | subtle | warm | worn | single | shellac | jazz | sinatra | jazz78
                        (default: warm)
   --set <k>=<v>        override a built-in parameter, repeatable
-                       (wet age crackle scratches crackle_level wow noise drive width gain 0..2,
+                       (wet age crackle crackle_level clicks click_level scratches wow noise
+                       drive width gain 0..2,
                        rpm 0=33⅓ 1=45 2=78)
   --au <name>          host an Audio Unit effect instead of the built-in DSP (e.g. \"Vinyl\")
   --chain              with --au: run the built-in DSP after the AU as well
@@ -125,7 +127,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
 
     let mut pipe = Pipeline::new(params.clone());
     pipe.apply(&cfg)?;
-    println!("▶ {}", pipe.status);
+    println!("▶ {}", pipe.status.text(Lang::En));
     println!("  {}", params.describe());
     println!("  Type `help` for commands, Ctrl-C to stop.");
 
@@ -146,7 +148,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             last_check = Instant::now();
             if pipe.needs_rebuild(&cfg) {
                 match pipe.apply(&cfg) {
-                    Ok(()) => println!("\n↻ {}", pipe.status),
+                    Ok(()) => println!("\n↻ {}", pipe.status.text(Lang::En)),
                     Err(e) => eprintln!("\n! {e}"),
                 }
             }
@@ -195,11 +197,12 @@ fn console(params: Arc<Params>, meter: Arc<crate::engine::Meter>, au: Option<au:
             ["meter"] => {
                 let db = |x: f32| if x > 0.0 { 20.0 * x.log10() } else { -120.0 };
                 println!(
-                    "  in {:>6.1} dBFS   out {:>6.1} dBFS   callbacks {}   frames {}",
+                    "  in {:>6.1} dBFS   out {:>6.1} dBFS   callbacks {}   frames {}   idle frames {}",
                     db(meter.in_peak.take()),
                     db(meter.out_peak.take()),
                     meter.callbacks.load(Relaxed),
-                    meter.frames.load(Relaxed)
+                    meter.frames.load(Relaxed),
+                    meter.idle_frames.load(Relaxed)
                 );
                 Ok(())
             }

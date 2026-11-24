@@ -40,6 +40,8 @@ const MONO_BASS_HZ: f32 = 150.0;
 const NOISE_GEN_RMS: f32 = 0.273;
 /// Output peak of the loudest dust tick per unit of click amplitude (see `tick_peak` test).
 const TICK_PEAK: f32 = 0.94;
+/// Output peak of the loudest click per unit of click amplitude (see `click_peak` test).
+const CLICK_PEAK: f32 = 0.88;
 
 const VOICES: usize = 16;
 const SCRATCHES: usize = 4;
@@ -243,8 +245,10 @@ struct Snapshot {
     wet: f32,
     age: f32,
     crackle: f32,
-    scratches: f32,
     crackle_level: f32,
+    clicks: f32,
+    click_level: f32,
+    scratches: f32,
     wow: f32,
     noise: f32,
     drive: f32,
@@ -282,7 +286,8 @@ pub struct Vinyl {
     voices: [Voice; VOICES],
     next_voice: usize,
     tick_p: f32,
-    pop_p: f32,
+    tick_lvl: f32,
+    click_p: f32,
     fizz_p: f32,
     fizz_lvl: f32,
     click_lvl: f32,
@@ -331,7 +336,8 @@ impl Vinyl {
             voices: [Voice::default(); VOICES],
             next_voice: 0,
             tick_p: 0.0,
-            pop_p: 0.0,
+            tick_lvl: 0.0,
+            click_p: 0.0,
             fizz_p: 0.0,
             fizz_lvl: 0.0,
             click_lvl: 0.0,
@@ -365,6 +371,8 @@ impl Vinyl {
             crackle: params.crackle.get(),
             scratches: params.scratches.get(),
             crackle_level: params.crackle_level.get(),
+            clicks: params.clicks.get(),
+            click_level: params.click_level.get(),
             wow: params.wow.get(),
             noise: params.noise.get(),
             drive: params.drive.get(),
@@ -404,20 +412,20 @@ impl Vinyl {
         self.sat_inv_k = 1.0 / self.sat_k;
         self.sat_c2 = 0.14 * p.drive * (1.0 + p.age);
 
-        // Dust sets how many ticks (up to ~25/s), pops (up to ~0.4/s) and quiet fizz; scratches
-        // set how many scratch slots (0..4) and how often they show up. Crackle level alone sets
-        // how loud: the loudest dust ticks peak there, most are up to 30 dB quieter, pops and
-        // scratches up to ~6 dB louder.
+        // Fine crackle: ticks up to ~25/s and quiet fizz; its level is where the loudest ticks
+        // peak. Clicks: up to ~3/s, peaking at the click level. Scratches: 0..4 slots, as loud as
+        // clicks. Amounts set how many, levels how loud; neither affects the other.
         let c = p.crackle;
         self.tick_p = (c.powf(1.5) * 25.0) / fs;
-        self.pop_p = (c * 0.4) / fs;
         self.fizz_p = (c * 300.0) / fs;
+        self.tick_lvl = 10f32.powf(crackle_peak_db(p.crackle_level) / 20.0) / TICK_PEAK;
+        self.click_p = (p.clicks.powf(1.5) * 3.0) / fs;
+        self.click_lvl = 10f32.powf(crackle_peak_db(p.click_level) / 20.0) / CLICK_PEAK;
         self.n_scratches = if p.scratches > 0.0 {
             ((p.scratches * SCRATCHES as f32).round() as usize).clamp(1, SCRATCHES)
         } else {
             0
         };
-        self.click_lvl = 10f32.powf(crackle_peak_db(p.crackle_level) / 20.0) / TICK_PEAK;
 
         // Groove noise from about -72 dBFS RMS (new record) to -42 dBFS (worn out).
         // Fizz peaks a little above the noise it belongs to.
@@ -561,18 +569,26 @@ impl Vinyl {
         self.density += (self.density_target - self.density) * 1.0e-5;
         let dn = self.density;
 
-        // Dust ticks barely ring (about one cycle), so they click rather than "plip".
         let u = self.rand();
-        if u < self.pop_p * dn {
-            let a = lvl * (1.0 + self.rand());
-            let (gl, gr) = self.random_gains(0.2);
-            self.trigger(a, 300.0, 1_000.0, 0.0004, 0.001, gl, gr);
-        } else if u < (self.pop_p + self.tick_p) * dn {
-            // log-distributed amplitude over ~30 dB: mostly faint, occasionally sharp
-            let a = lvl * 10f32.powf(-1.5 * self.rand());
+        if u < self.click_p * dn {
+            // A distinct click: similar loudness every time (within 6 dB). Mostly a sharp tick
+            // with a small thud under it, sometimes a duller pop.
+            let a = lvl * (0.5 + 0.5 * self.rand());
+            let (gl, gr) = self.random_gains(0.5);
+            if self.rand() < 0.7 {
+                self.trigger(a, 1_500.0, 5_000.0, 0.00006, 0.00015, gl, gr);
+                self.trigger(a * 0.3, 200.0, 400.0, 0.0006, 0.0012, gl, gr);
+            } else {
+                self.trigger(a, 300.0, 1_000.0, 0.0004, 0.001, gl, gr);
+            }
+        } else if u < (self.click_p + self.tick_p) * dn {
+            // Fine crackle: ticks barely ring (about one cycle), so they click rather than "plip";
+            // amplitude log-distributed over ~30 dB, mostly faint (as before crackle and clicks
+            // were split, so the same settings sound the same).
+            let a = self.tick_lvl * 10f32.powf(-1.5 * self.rand());
             let (gl, gr) = self.random_gains(0.6);
             self.trigger(a, 2_500.0, 8_000.0, 0.00003, 0.0001, gl, gr);
-        } else if u < (self.pop_p + self.tick_p + self.fizz_p) * dn {
+        } else if u < (self.click_p + self.tick_p + self.fizz_p) * dn {
             // Fizz is surface texture: it sits at the groove-noise level, not the click level.
             let a = self.fizz_lvl * self.rand();
             let (gl, gr) = self.random_gains(1.0);
@@ -685,7 +701,7 @@ impl Vinyl {
         let (mut wl, mut wr) = (m + sd, m - sd);
 
         // --- surface
-        if p.crackle > 0.0 || p.scratches > 0.0 {
+        if p.crackle > 0.0 || p.clicks > 0.0 || p.scratches > 0.0 {
             let (cl, cr) = self.crackle(prev);
             wl += cl * self.surface;
             wr += cr * self.surface;
@@ -796,6 +812,7 @@ mod tests {
             ("wet", 1.0),
             ("age", 0.0),
             ("crackle", 0.0),
+            ("clicks", 0.0),
             ("scratches", 0.0),
             ("noise", 0.0),
             ("wow", 0.0),
@@ -1048,41 +1065,62 @@ mod tests {
         assert!(low < total * 0.05, "below 60 Hz {low} vs total {total}");
     }
 
-    /// Peak of dust ticks alone (no pops, fizz or scratches) over a minute.
-    fn dust_tick_peak(level: f32) -> f32 {
-        let fs = 48_000.0;
-        let mut v = Vinyl::new(fs as f64);
-        v.update(&clean(&[("crackle", 1.0), ("crackle_level", level)]));
-        v.pop_p = 0.0;
+    /// Peak in dBFS over a minute of silence with only the given sources on (no fizz).
+    fn crackle_peak_db_of(overrides: &[(&str, f32)]) -> f32 {
+        let mut v = Vinyl::new(48_000.0);
+        v.update(&clean(overrides));
         v.fizz_p = 0.0;
-        v.n_scratches = 0;
         let out = run(&mut v, 48_000 * 60, |_| 0.0);
-        out.iter().fold(0f32, |m, (l, r)| m.max(l.abs()).max(r.abs()))
+        let peak = out.iter().fold(0f32, |m, (l, r)| m.max(l.abs()).max(r.abs()));
+        20.0 * peak.log10()
     }
 
     #[test]
     fn tick_peak() {
-        let db = |x: f32| 20.0 * x.log10();
-        let target = crackle_peak_db(0.53);
-        let got = db(dust_tick_peak(0.53));
+        let target = crackle_peak_db(0.5);
+        let got = crackle_peak_db_of(&[("crackle", 1.0), ("crackle_level", 0.5)]);
         assert!((got - target).abs() < 1.5, "loudest ticks {got:.1} dBFS, want {target:.1}");
     }
 
     #[test]
-    fn crackle_level_scales_loudness_not_count() {
-        let fs = 48_000.0;
-        let render = |level: f32| {
-            let mut v = Vinyl::new(fs as f64);
-            v.update(&clean(&[("crackle", 0.6), ("crackle_level", level)]));
+    fn click_peak() {
+        let target = crackle_peak_db(0.5);
+        let got = crackle_peak_db_of(&[("clicks", 1.0), ("click_level", 0.5)]);
+        assert!((got - target).abs() < 1.5, "loudest clicks {got:.1} dBFS, want {target:.1}");
+    }
+
+    /// The louder render is the quieter one scaled up: same random stream, only the level differs.
+    fn assert_level_only_scales(amount: &str, level: &str) {
+        let render = |lvl: f32| {
+            let mut v = Vinyl::new(48_000.0);
+            v.update(&clean(&[(amount, 0.8), (level, lvl)]));
             run(&mut v, 48_000 * 5, |_| 0.0)
         };
         let (quiet, loud) = (render(0.2), render(0.8));
 
-        // Same random stream, so the louder render is the quieter one scaled up.
         let k = 10f32.powf((crackle_peak_db(0.8) - crackle_peak_db(0.2)) / 20.0);
         for (q, l) in quiet.iter().zip(&loud) {
-            assert!((q.0 * k - l.0).abs() <= 1e-4 + 1e-3 * l.0.abs(), "{} vs {}", q.0 * k, l.0);
+            assert!((q.0 * k - l.0).abs() <= 1e-4 + 1e-3 * l.0.abs(), "{amount}: {} vs {}", q.0 * k, l.0);
         }
+    }
+
+    #[test]
+    fn levels_scale_loudness_not_count() {
+        assert_level_only_scales("crackle", "crackle_level");
+        assert_level_only_scales("clicks", "click_level");
+    }
+
+    #[test]
+    fn crackle_and_clicks_are_independent() {
+        // The click level does nothing to crackle alone, and vice versa.
+        let crackle = |click_level: f32| {
+            crackle_peak_db_of(&[("crackle", 1.0), ("crackle_level", 0.5), ("click_level", click_level)])
+        };
+        assert_eq!(crackle(0.0), crackle(1.0));
+        let clicks = |crackle_level: f32| {
+            crackle_peak_db_of(&[("clicks", 1.0), ("click_level", 0.5), ("crackle_level", crackle_level)])
+        };
+        assert_eq!(clicks(0.0), clicks(1.0));
     }
 
     /// Gate gain after feeding `secs` of a constant input level.

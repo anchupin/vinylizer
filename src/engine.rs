@@ -18,6 +18,8 @@ pub struct Meter {
     pub out_peak: AtomicF32,
     pub callbacks: AtomicU64,
     pub frames: AtomicU64,
+    /// Frames the idle needle played (with any gain); should stay 0 while the main engine runs.
+    pub idle_frames: AtomicU64,
 }
 
 pub struct Engine {
@@ -218,7 +220,8 @@ pub struct IdleEngine {
 
 impl IdleEngine {
     /// Main-engine callbacks it must miss before the needle plays here instead.
-    const QUIET_CALLBACKS: u32 = 3;
+    /// About a quarter of a second: also covers the main route starting up after this one.
+    const QUIET_CALLBACKS: u32 = 20;
 
     pub fn new(params: Arc<Params>, meter: Arc<Meter>, sample_rate: f64) -> Self {
         let mut vinyl = Vinyl::new(sample_rate);
@@ -278,6 +281,7 @@ impl IdleEngine {
         }
 
         self.meter.out_peak.max(peak);
+        self.meter.idle_frames.fetch_add(frames as u64, Relaxed);
     }
 }
 

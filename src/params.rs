@@ -2,6 +2,7 @@
 //! real-time audio thread. Writers bump `version`; the RT side re-derives
 //! filter coefficients only when the version changes (once per block).
 
+use crate::i18n::L;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 #[derive(Debug, Default)]
@@ -36,9 +37,11 @@ impl AtomicF32 {
 pub struct Params {
     pub wet: AtomicF32,     // dry/wet mix
     pub age: AtomicF32,     // record wear: HF roll-off + low-mid warmth
-    pub crackle: AtomicF32, // how many dust ticks and pops
+    pub crackle: AtomicF32, // how much fine crackle: frequent faint ticks and fizz
+    pub crackle_level: AtomicF32, // how loud the fine crackle is, see `crackle_peak_db`
+    pub clicks: AtomicF32,  // how many distinct clicks and pops
+    pub click_level: AtomicF32, // how loud clicks and scratches are, see `crackle_peak_db`
     pub scratches: AtomicF32, // how often scratches show up; each ticks once per revolution
-    pub crackle_level: AtomicF32, // how loud dust and scratches are, see `crackle_peak_db`
     pub wow: AtomicF32,     // wow/flutter depth
     pub noise: AtomicF32,   // groove surface noise
     pub drive: AtomicF32,   // stylus distortion (even-order, treble-weighted)
@@ -52,53 +55,72 @@ pub struct Params {
 }
 
 pub const PARAM_NAMES: &[&str] = &[
-    "wet", "age", "crackle", "scratches", "crackle_level", "wow", "noise", "drive", "width", "gain",
-    "rpm",
+    "wet", "age", "crackle", "crackle_level", "clicks", "scratches", "click_level", "wow", "noise",
+    "drive", "width", "gain", "rpm",
 ];
 
 /// What each parameter is called in the UI and what it does, in the order of `PARAM_NAMES`.
-pub const PARAM_INFO: &[(&str, &str, &str)] = &[
-    ("wet", "Сила эффекта", "Сколько «пластинки» подмешано к оригиналу"),
-    ("age", "Износ пластинки", "Глушит верха: 0 — новая, 100% — заиграна"),
-    ("crackle", "Пыль", "Сколько случайного треска и щелчков"),
-    ("scratches", "Царапины", "Как часто появляется щелчок, повторяющийся каждый оборот"),
-    ("crackle_level", "Громкость треска", "Насколько громко щёлкают пыль и царапины"),
-    ("wow", "Плавание тона", "Неровный ход диска и биение пластинки"),
-    ("noise", "Шум поверхности", "Шорох канавки, «дышит» в такт обороту"),
-    ("drive", "Искажения иглы", "Тёплая грязь на громких местах и шипящих"),
-    ("width", "Ширина стерео", "0 — моно, как у 78-х; бас моно всегда"),
-    ("gain", "Громкость", "Итоговый уровень; 0 dB — без изменений"),
-    ("rpm", "Скорость", "Задаёт период щелчков и плавания"),
+pub const PARAM_INFO: &[(&str, L, L)] = &[
+    ("wet", L::new("Сила эффекта", "Effect amount"),
+        L::new("Сколько «пластинки» подмешано к оригиналу", "How much “record” is mixed into the original")),
+    ("age", L::new("Износ пластинки", "Record wear"),
+        L::new("Глушит верха: 0 — новая, 100% — заиграна", "Dulls the highs: 0 — new, 100% — worn out")),
+    ("crackle", L::new("Треск", "Crackle"),
+        L::new("Частое мелкое потрескивание — фон пластинки", "Frequent faint crackling — the record’s background")),
+    ("crackle_level", L::new("Громкость треска", "Crackle level"),
+        L::new("Насколько громок мелкий треск", "How loud the fine crackle is")),
+    ("clicks", L::new("Щелчки", "Clicks"),
+        L::new("Отдельные заметные щелчки и хлопки", "Distinct clicks and pops")),
+    ("scratches", L::new("Царапины", "Scratches"),
+        L::new("Как часто появляется щелчок, повторяющийся каждый оборот", "How often a click that repeats every revolution appears")),
+    ("click_level", L::new("Громкость щелчков", "Click level"),
+        L::new("Насколько громко щёлкают щелчки и царапины", "How loud clicks and scratches are")),
+    ("wow", L::new("Плавание тона", "Wow & flutter"),
+        L::new("Неровный ход диска и биение пластинки", "Uneven platter speed and record wobble")),
+    ("noise", L::new("Шум поверхности", "Surface noise"),
+        L::new("Шорох канавки, «дышит» в такт обороту", "Groove hiss that “breathes” with each revolution")),
+    ("drive", L::new("Искажения иглы", "Stylus distortion"),
+        L::new("Тёплая грязь на громких местах и шипящих", "Warm grit on loud parts and sibilants")),
+    ("width", L::new("Ширина стерео", "Stereo width"),
+        L::new("0 — моно, как у 78-х; бас моно всегда", "0 — mono, like 78s; bass is always mono")),
+    ("gain", L::new("Громкость", "Volume"),
+        L::new("Итоговый уровень; 0 dB — без изменений", "Output level; 0 dB — unchanged")),
+    ("rpm", L::new("Скорость", "Speed"),
+        L::new("Задаёт период щелчков и плавания", "Sets the period of scratches and wow")),
 ];
 
-pub const RPM_LABELS: &[&str] = &["33⅓ об/мин", "45 об/мин", "78 об/мин"];
+pub const RPM_LABELS: &[L] = &[
+    L::new("33⅓ об/мин", "33⅓ rpm"),
+    L::new("45 об/мин", "45 rpm"),
+    L::new("78 об/мин", "78 rpm"),
+];
 
 /// What "reset" returns the built-in effect to.
 pub const DEFAULT_PRESET: &str = "warm";
 
-/// Peak level of the loud dust ticks, dBFS, for a `crackle_level` of 0..1 (−40 to 0 dBFS).
-/// Ticks are a fraction of a millisecond long, so even 0 dBFS sounds quieter than music at
+/// Peak level, dBFS, of the loudest crackle ticks or clicks for a level of 0..1 (−40 to 0 dBFS).
+/// They are a fraction of a millisecond long, so even 0 dBFS sounds quieter than music at
 /// that level; the output limiter keeps anything louder from clipping.
 pub fn crackle_peak_db(level: f32) -> f32 {
     -40.0 + 40.0 * level
 }
 
-pub const PRESETS: &[(&str, &str, [f32; 11])] = &[
-    //                                  wet   age   dust  scrat level wow   noise drive width gain rpm
-    // crackle level: new −30, subtle −26, warm −22, single/jazz −20, worn −16, jazz78 −14, shellac −12 dBFS
-    ("new", "Новая пластинка", [1.0, 0.15, 0.08, 0.00, 0.25, 0.10, 0.15, 0.20, 0.95, 1.0, 0.0]),
-    ("subtle", "Чуть-чуть", [1.0, 0.30, 0.15, 0.05, 0.35, 0.15, 0.20, 0.25, 0.90, 1.0, 0.0]),
-    ("warm", "Тёплая", [1.0, 0.45, 0.25, 0.15, 0.45, 0.25, 0.30, 0.35, 0.85, 1.0, 0.0]),
-    ("worn", "Заигранная", [1.0, 0.60, 0.60, 0.45, 0.60, 0.40, 0.50, 0.50, 0.80, 1.0, 0.0]),
-    ("single", "Сингл 45", [1.0, 0.35, 0.30, 0.20, 0.50, 0.20, 0.25, 0.40, 0.85, 1.0, 1.0]),
-    ("shellac", "Шеллак 78", [1.0, 0.95, 0.80, 0.50, 0.70, 0.50, 0.70, 0.60, 0.00, 1.1, 2.0]),
+pub const PRESETS: &[(&str, L, [f32; 13])] = &[
+    //                       wet   age   crack c.lvl click scrat k.lvl wow   noise drive width gain  rpm
+    // crackle level: new −34 … shellac −18 dBFS; click level: new −28 … shellac −10 dBFS
+    ("new", L::new("Новая пластинка", "New record"), [1.0, 0.15, 0.10, 0.15, 0.05, 0.00, 0.30, 0.10, 0.15, 0.20, 0.95, 1.0, 0.0]),
+    ("subtle", L::new("Чуть-чуть", "Subtle"), [1.0, 0.30, 0.18, 0.25, 0.10, 0.05, 0.40, 0.15, 0.20, 0.25, 0.90, 1.0, 0.0]),
+    ("warm", L::new("Тёплая", "Warm"), [1.0, 0.45, 0.30, 0.30, 0.20, 0.15, 0.50, 0.25, 0.30, 0.35, 0.85, 1.0, 0.0]),
+    ("worn", L::new("Заигранная", "Worn"), [1.0, 0.60, 0.60, 0.45, 0.50, 0.45, 0.65, 0.40, 0.50, 0.50, 0.80, 1.0, 0.0]),
+    ("single", L::new("Сингл 45", "45 single"), [1.0, 0.35, 0.30, 0.35, 0.25, 0.20, 0.55, 0.20, 0.25, 0.40, 0.85, 1.0, 1.0]),
+    ("shellac", L::new("Шеллак 78", "Shellac 78"), [1.0, 0.95, 0.80, 0.55, 0.60, 0.50, 0.75, 0.50, 0.70, 0.60, 0.00, 1.1, 2.0]),
     // Derived from the user's iZotope Vinyl presets (Year / Wear / Dust / Scratch / Warp / Noise / Mono):
     // Jazz: 1950s, wear 25 %, dust 40 % loud, light scratches, no warp, quiet motor, stereo
-    ("jazz", "Джаз 50-х", [1.0, 0.40, 0.30, 0.10, 0.50, 0.05, 0.20, 0.25, 0.90, 1.0, 0.0]),
+    ("jazz", L::new("Джаз 50-х", "1950s jazz"), [1.0, 0.40, 0.35, 0.35, 0.25, 0.10, 0.55, 0.05, 0.20, 0.25, 0.90, 1.0, 0.0]),
     // Sinatra 50s: 1950s, wear 30 %, softer dust, a touch more motor noise
-    ("sinatra", "Синатра 50-х", [1.0, 0.45, 0.22, 0.10, 0.45, 0.05, 0.25, 0.30, 0.85, 1.0, 0.0]),
+    ("sinatra", L::new("Синатра 50-х", "Sinatra 50s"), [1.0, 0.45, 0.28, 0.30, 0.18, 0.10, 0.50, 0.05, 0.25, 0.30, 0.85, 1.0, 0.0]),
     // Old 78 Jazz: 1930s 78 rpm, wear 40 %, dust 50 %, more scratches, slight warp, mono
-    ("jazz78", "Старый джаз 78", [1.0, 0.90, 0.50, 0.35, 0.65, 0.15, 0.50, 0.45, 0.00, 1.05, 2.0]),
+    ("jazz78", L::new("Старый джаз 78", "Old jazz 78"), [1.0, 0.90, 0.55, 0.50, 0.45, 0.35, 0.70, 0.15, 0.50, 0.45, 0.00, 1.05, 2.0]),
 ];
 
 impl Params {
@@ -107,8 +129,10 @@ impl Params {
             wet: AtomicF32::new(0.0),
             age: AtomicF32::new(0.0),
             crackle: AtomicF32::new(0.0),
-            scratches: AtomicF32::new(0.0),
             crackle_level: AtomicF32::new(0.0),
+            clicks: AtomicF32::new(0.0),
+            click_level: AtomicF32::new(0.0),
+            scratches: AtomicF32::new(0.0),
             wow: AtomicF32::new(0.0),
             noise: AtomicF32::new(0.0),
             drive: AtomicF32::new(0.0),
@@ -128,8 +152,10 @@ impl Params {
             "wet" => &self.wet,
             "age" => &self.age,
             "crackle" => &self.crackle,
-            "scratches" => &self.scratches,
             "crackle_level" => &self.crackle_level,
+            "clicks" => &self.clicks,
+            "click_level" => &self.click_level,
+            "scratches" => &self.scratches,
             "wow" => &self.wow,
             "noise" => &self.noise,
             "drive" => &self.drive,

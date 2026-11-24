@@ -20,6 +20,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vinylizer::i18n::Lang;
 use vinylizer::params::{
     crackle_peak_db, Params, DEFAULT_PRESET, PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS,
 };
@@ -46,13 +47,39 @@ const BOOL_RET_TYPES: &CStr = c"c@:";
 const OWN_BUNDLE: &str = "dev.vinylizer";
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
+/// Current interface language (true = English), read by every text in the UI.
+static LANG_EN: AtomicBool = AtomicBool::new(false);
+
+fn lang() -> Lang {
+    if LANG_EN.load(Relaxed) {
+        Lang::En
+    } else {
+        Lang::Ru
+    }
+}
+
+/// The text for the current interface language.
+fn tr(ru: &'static str, en: &'static str) -> &'static str {
+    lang().pick(ru, en)
+}
+
+/// The macOS preferred language, used until the user picks one in the panel.
+unsafe fn system_lang() -> Lang {
+    let langs = send!(class(c"NSLocale"), "preferredLanguages"; -> Id);
+    if langs.is_null() || send!(langs, "count"; -> usize) == 0 {
+        return Lang::En;
+    }
+    let first = send!(langs, "objectAtIndex:", 0usize => usize; -> Id);
+    Lang::for_locale(&ns_to_string(first))
+}
+
 // Popover geometry, points.
 const W: f64 = 400.0;
 const PAD: f64 = 16.0;
 const FIELD_X: f64 = 120.0;
 const SLIDER_X: f64 = 160.0;
 const VALUE_W: f64 = 58.0;
-const MAX_H: f64 = 720.0;
+const MAX_H: f64 = 820.0;
 
 // Tags in the plugin preset pop-up.
 const NO_PRESET: isize = -1;
@@ -346,7 +373,7 @@ unsafe fn new_alert(title: &str, info: &str, buttons: &[&str]) -> Id {
 
 /// Modal text prompt; `None` if cancelled or empty.
 unsafe fn prompt(title: &str, info: &str, default: &str, ok: &str) -> Option<String> {
-    let alert = new_alert(title, info, &[ok, "Отмена"]);
+    let alert = new_alert(title, info, &[ok, tr("Отмена", "Cancel")]);
     let tf = send!(send!(class(c"NSTextField"), "alloc"; -> Id), "initWithFrame:", NSRect::new(0.0, 0.0, 280.0, 24.0) => NSRect; -> Id);
     let d = ns(default);
     send!(tf, "setStringValue:", d.0 as Id => Id; -> ());
@@ -366,7 +393,7 @@ unsafe fn prompt(title: &str, info: &str, default: &str, ok: &str) -> Option<Str
 }
 
 unsafe fn confirm(title: &str, info: &str, ok: &str) -> bool {
-    let alert = new_alert(title, info, &[ok, "Отмена"]);
+    let alert = new_alert(title, info, &[ok, tr("Отмена", "Cancel")]);
     let r = send!(alert, "runModal"; -> isize);
     send!(alert, "release"; -> ());
     r == 1000
@@ -560,8 +587,8 @@ fn format_builtin(name: &str, v: f32) -> String {
                 format!("{db:+.1} dB")
             }
         }
-        "width" if v < 0.005 => "моно".into(),
-        "crackle_level" => format!("{:.0} dB", crackle_peak_db(v)),
+        "width" if v < 0.005 => tr("моно", "mono").into(),
+        "crackle_level" | "click_level" => format!("{:.0} dB", crackle_peak_db(v)),
         _ => format!("{:.0}%", v * 100.0),
     }
 }
@@ -589,7 +616,7 @@ impl Ui {
             self.cfg.targets,
             self.cfg.au,
             r.as_ref().map(|_| ()),
-            self.pipe.status,
+            self.pipe.status.text(Lang::En),
             self.pipe.au().map(|a| a.name.clone())
         ));
 
@@ -607,7 +634,7 @@ impl Ui {
         }
         let off = !self.pipe.is_running();
         send!(button, "setAppearsDisabled:", if off { YES } else { NO } => ObjcBool; -> ());
-        let tip = ns(&format!("Vinylizer — {}", self.pipe.status));
+        let tip = ns(&format!("Vinylizer — {}", self.pipe.status.text(lang())));
         send!(button, "setToolTip:", tip.0 as Id => Id; -> ());
     }
 
@@ -751,6 +778,22 @@ impl Ui {
         activate_app();
         send!(self.popover, "showRelativeToRect:ofView:preferredEdge:",
             bounds => NSRect, button => Id, 1usize => usize; -> ()); // below the icon
+
+        // A menu bar app is not always activated by the click itself; an inactive popover
+        // draws controls such as the on/off switch in grey, as if they were off.
+        activate_app();
+        let win = self.popover_window();
+        if !win.is_null() {
+            send!(win, "makeKeyWindow"; -> ());
+        }
+    }
+
+    unsafe fn popover_window(&self) -> Id {
+        let vc = send!(self.popover, "contentViewController"; -> Id);
+        if vc.is_null() {
+            return ptr::null_mut();
+        }
+        send!(send!(vc, "view"; -> Id), "window"; -> Id)
     }
 
     /// Rebuild later, outside the action of a control the rebuild would free.
@@ -771,7 +814,7 @@ impl Ui {
             Mode::Plugin => self.build_plugin(&mut r),
         }
         r.rule();
-        let quit = button("Выйти", self.controller, c"quit:");
+        let quit = button(tr("Выйти", "Quit"), self.controller, c"quit:");
         r.put(quit, W - PAD - 80.0, 0.0, 80.0, 24.0);
         r.y += 32.0;
 
@@ -789,13 +832,16 @@ impl Ui {
     unsafe fn build_header(&mut self, r: &mut Rows) {
         let c = self.controller;
 
-        r.put(text("Vinylizer", 13.0, true, false), PAD, 0.0, 200.0, 18.0);
+        r.put(text("Vinylizer", 13.0, true, false), PAD, 0.0, 160.0, 18.0);
+        let langs = segmented(&["RU", "EN"], (lang() == Lang::En) as isize, c, c"selectLang:");
+        set_tooltip(langs, tr("Язык интерфейса", "Interface language"));
+        r.put(langs, W - PAD - 38.0 - 12.0 - 76.0, 0.0, 76.0, 20.0);
         let sw = on_off_switch(self.cfg.enabled, c, c"toggleEnabled:");
-        set_tooltip(sw, "Включить или выключить обработку звука");
+        set_tooltip(sw, tr("Включить или выключить обработку звука", "Turn sound processing on or off"));
         r.put(sw, W - PAD - 38.0, -1.0, 38.0, 20.0);
         self.c.enabled = sw;
         r.y += 21.0;
-        let st = text(&self.pipe.status, 11.0, false, true);
+        let st = text(&self.pipe.status.text(lang()), 11.0, false, true);
         r.put(st, PAD, 0.0, W - 2.0 * PAD, 15.0);
         self.c.status = st;
         r.y += 18.0;
@@ -810,45 +856,47 @@ impl Ui {
             .map(|a| a.name.as_str())
             .collect();
         let title = if self.cfg.targets.is_empty() {
-            "Все приложения".to_string()
+            tr("Все приложения", "All apps").to_string()
         } else {
             chosen.join(", ")
         };
         let p = popup(c, c"selectTarget:", true);
         popup_add(p, &title, -2);
-        set_state(popup_add(p, "Все приложения", -1), self.cfg.targets.is_empty());
+        set_state(popup_add(p, tr("Все приложения", "All apps"), -1), self.cfg.targets.is_empty());
         popup_separator(p);
         if self.apps.is_empty() {
-            set_enabled(popup_add(p, "Никто не играет звук", -3), false);
+            set_enabled(popup_add(p, tr("Никто не играет звук", "No apps are playing"), -3), false);
         }
         for (i, a) in self.apps.iter().enumerate() {
             let t = match (a.playing, a.running) {
                 (true, _) => format!("{}   ♪", a.name),
-                (false, false) => format!("{}   (не запущено)", a.name),
+                (false, false) => format!("{}   ({})", a.name, tr("не запущено", "not running")),
                 _ => a.name.clone(),
             };
             set_state(popup_add(p, &t, i as isize), self.cfg.targets.contains(&a.root));
         }
-        r.field("Применять к", p, W - FIELD_X - PAD);
+        r.field(tr("Применять к", "Apply to"), p, W - FIELD_X - PAD);
 
         // ---- mode
         let mode = match self.cfg.mode {
             Mode::Builtin => 0,
             Mode::Plugin => 1,
         };
-        let seg = segmented(&["Vinylizer", "Сторонний плагин"], mode, c, c"selectMode:");
-        r.field("Режим", seg, W - FIELD_X - PAD);
+        let seg = segmented(&["Vinylizer", tr("Сторонний плагин", "Third-party plugin")], mode, c, c"selectMode:");
+        r.field(tr("Режим", "Mode"), seg, W - FIELD_X - PAD);
 
         let idle = checkbox(
-            "Треск без музыки",
+            tr("Треск без музыки", "Crackle without music"),
             self.pipe.params.idle_surface.load(Relaxed),
             c,
             c"toggleIdleSurface:",
         );
         set_tooltip(
             idle,
-            "Пластинка крутится и в тишине: треск и шум не затихают на паузе. \
-             Работает, пока есть звуковой маршрут: «Все приложения» или открытое выбранное приложение.",
+            tr(
+                "Пластинка крутится и в тишине: треск и шум не затихают на паузе.",
+                "The record keeps spinning in silence: crackle and noise don’t fade out on pause.",
+            ),
         );
         r.put(idle, FIELD_X, 0.0, W - FIELD_X - PAD, 18.0);
         self.c.idle = idle;
@@ -862,7 +910,7 @@ impl Ui {
 
         let p = popup(c, c"selectPreset:", false);
         for (i, (_, label, _)) in PRESETS.iter().enumerate() {
-            popup_add(p, label, i as isize);
+            popup_add(p, label.get(lang()), i as isize);
         }
         self.builtin_user = builtin_user_presets(&user_preset_dir());
         if !self.builtin_user.is_empty() {
@@ -872,32 +920,32 @@ impl Ui {
             popup_add(p, name, USER_BASE + i as isize);
         }
         popup_separator(p);
-        popup_add(p, "Свой (не сохранён)", -1);
+        popup_add(p, tr("Свой (не сохранён)", "Custom (unsaved)"), -1);
         self.c.preset = p;
-        let bp = checkbox("Без эффекта", params.bypass.load(Relaxed), c, c"toggleBypass:");
-        set_tooltip(bp, "Сравнить с оригиналом: звук идёт мимо эффекта, пока галочка стоит");
+        let bp = checkbox(tr("Без эффекта", "Bypass"), params.bypass.load(Relaxed), c, c"toggleBypass:");
+        set_tooltip(bp, tr("Сравнить с оригиналом: звук идёт мимо эффекта, пока галочка стоит", "Compare with the original: sound skips the effect while this is checked"));
         r.put(bp, W - PAD - 96.0, 3.0, 96.0, 18.0);
         self.c.bypass = bp;
-        r.field("Пресет", p, W - FIELD_X - PAD - 104.0);
+        r.field(tr("Пресет", "Preset"), p, W - FIELD_X - PAD - 104.0);
 
-        let save = button("Сохранить", c, c"saveBuiltinPreset:");
-        set_tooltip(save, "Перезаписать свой пресет текущими настройками");
-        let save_as = button("Сохранить как…", c, c"saveBuiltinPresetAs:");
-        set_tooltip(save_as, "Сохранить текущие настройки под новым именем");
-        let del = button("Удалить…", c, c"deleteBuiltinPreset:");
-        let reset = button("Сбросить", c, c"resetBuiltin:");
-        set_tooltip(reset, "Вернуть настройки по умолчанию (пресет «Тёплая»)");
+        let save = button(tr("Сохранить", "Save"), c, c"saveBuiltinPreset:");
+        set_tooltip(save, tr("Перезаписать свой пресет текущими настройками", "Overwrite your preset with the current settings"));
+        let save_as = button(tr("Сохранить как…", "Save As…"), c, c"saveBuiltinPresetAs:");
+        set_tooltip(save_as, tr("Сохранить текущие настройки под новым именем", "Save the current settings under a new name"));
+        let del = button(tr("Удалить…", "Delete…"), c, c"deleteBuiltinPreset:");
+        let reset = button(tr("Сбросить", "Reset"), c, c"resetBuiltin:");
+        set_tooltip(reset, tr("Вернуть настройки по умолчанию (пресет «Тёплая»)", "Back to the defaults (the “Warm” preset)"));
         r.buttons(PAD, &[(save, 84.0), (save_as, 110.0), (del, 76.0), (reset, 74.0)]);
         self.c.preset_save = save;
         self.c.preset_delete = del;
 
         let rp = popup(c, c"selectRpm:", false);
         for (i, l) in RPM_LABELS.iter().enumerate() {
-            popup_add(rp, l, i as isize);
+            popup_add(rp, l.get(lang()), i as isize);
         }
-        set_tooltip(rp, PARAM_INFO[PARAM_NAMES.len() - 1].2);
+        set_tooltip(rp, PARAM_INFO[PARAM_NAMES.len() - 1].2.get(lang()));
         self.c.rpm = rp;
-        r.field("Скорость", rp, 140.0);
+        r.field(tr("Скорость", "Speed"), rp, 140.0);
         r.y += 4.0;
 
         self.c.sliders = vec![(ptr::null_mut(), ptr::null_mut()); PARAM_NAMES.len()];
@@ -910,8 +958,8 @@ impl Ui {
             self.c.sliders[i] = self.slider_row(
                 r,
                 i,
-                name,
-                Some(hint),
+                name.get(lang()),
+                Some(hint.get(lang())),
                 v as f64,
                 0.0,
                 max,
@@ -935,13 +983,13 @@ impl Ui {
 
         let p = popup(c, c"selectEffect:", false);
         if self.cfg.au.is_none() {
-            popup_add(p, "Выберите плагин", -1);
+            popup_add(p, tr("Выберите плагин", "Choose a plugin"), -1);
         }
         for (i, n) in self.effects.iter().enumerate() {
             popup_add(p, n, i as isize);
         }
         if self.effects.is_empty() {
-            set_enabled(popup_add(p, "Нет установленных AU-эффектов", -2), false);
+            set_enabled(popup_add(p, tr("Нет установленных AU-эффектов", "No AU effects installed"), -2), false);
         }
         let sel_tag = self
             .cfg
@@ -950,18 +998,18 @@ impl Ui {
             .and_then(|a| self.effects.iter().position(|e| e == a))
             .map_or(-1, |i| i as isize);
         popup_select_tag(p, sel_tag);
-        let win = button("Окно плагина…", c, c"openPluginUI:");
+        let win = button(tr("Окно плагина…", "Plugin Window…"), c, c"openPluginUI:");
         set_enabled(win, self.pipe.au().is_some());
         r.put(win, W - PAD - 110.0, 0.0, 110.0, 24.0);
-        r.field("Плагин", p, W - FIELD_X - PAD - 116.0);
+        r.field(tr("Плагин", "Plugin"), p, W - FIELD_X - PAD - 116.0);
 
         let Some(plugin) = self.pipe.au() else {
             let why = if self.cfg.au.is_none() {
-                "Выберите плагин из списка выше"
+                tr("Выберите плагин из списка выше", "Choose a plugin from the list above")
             } else if !self.cfg.enabled {
-                "Плагин загрузится, когда Vinylizer включён"
+                tr("Плагин загрузится, когда Vinylizer включён", "The plugin loads when Vinylizer is on")
             } else {
-                "Плагин не загружен — см. статус вверху"
+                tr("Плагин не загружен — см. статус вверху", "The plugin is not loaded — see the status above")
             };
             r.put(text(why, 11.0, false, true), PAD, 0.0, W - 2.0 * PAD, 15.0);
             r.y += 20.0;
@@ -987,13 +1035,13 @@ impl Ui {
             popup_add(pp, name, FACTORY_BASE + *num as isize);
         }
         self.c.au_preset = pp;
-        r.field("Пресет", pp, W - FIELD_X - PAD);
+        r.field(tr("Пресет", "Preset"), pp, W - FIELD_X - PAD);
 
-        let save = button("Сохранить", c, c"savePreset:");
-        let save_as = button("Сохранить как…", c, c"savePresetAs:");
-        let del = button("Удалить…", c, c"deletePreset:");
-        let reset = button("Сбросить", c, c"resetPlugin:");
-        set_tooltip(reset, "Вернуть плагину настройки по умолчанию");
+        let save = button(tr("Сохранить", "Save"), c, c"savePreset:");
+        let save_as = button(tr("Сохранить как…", "Save As…"), c, c"savePresetAs:");
+        let del = button(tr("Удалить…", "Delete…"), c, c"deletePreset:");
+        let reset = button(tr("Сбросить", "Reset"), c, c"resetPlugin:");
+        set_tooltip(reset, tr("Вернуть плагину настройки по умолчанию", "Back to the plugin’s defaults"));
         r.buttons(PAD, &[(save, 84.0), (save_as, 110.0), (del, 76.0), (reset, 74.0)]);
         self.c.au_save = save;
         self.c.au_delete = del;
@@ -1006,7 +1054,7 @@ impl Ui {
             .filter(|p| p.flags & kAudioUnitParameterFlag_IsWritable != 0 && p.max > p.min)
             .collect();
         if self.au_params.is_empty() {
-            r.put(text("Нет изменяемых параметров", 11.0, false, true), PAD, 0.0, 300.0, 15.0);
+            r.put(text(tr("Нет изменяемых параметров", "No editable parameters"), 11.0, false, true), PAD, 0.0, 300.0, 15.0);
             r.y += 20.0;
         }
         for i in 0..self.au_params.len() {
@@ -1111,7 +1159,7 @@ impl Ui {
 
     unsafe fn refresh_header(&self) {
         if !self.c.status.is_null() {
-            set_text(self.c.status, &self.pipe.status);
+            set_text(self.c.status, &self.pipe.status.text(lang()));
         }
         if !self.c.enabled.is_null() {
             send!(self.c.enabled, "setState:", self.cfg.enabled as isize => isize; -> ());
@@ -1178,7 +1226,7 @@ impl Ui {
         for (i, (name, _)) in self.builtin_user.iter().enumerate() {
             let it = send!(menu, "itemWithTag:", USER_BASE + i as isize => isize; -> Id);
             let t = ns(&if edited && current == Some(i) {
-                format!("{name} (изменён)")
+                format!("{name} ({})", tr("изменён", "edited"))
             } else {
                 name.clone()
             });
@@ -1234,7 +1282,7 @@ impl Ui {
         for (i, (name, _)) in self.au_user_presets.iter().enumerate() {
             let it = send!(menu, "itemWithTag:", i as isize => isize; -> Id);
             let t = ns(&if self.au_modified && i as isize == tag {
-                format!("{name} (изменён)")
+                format!("{name} ({})", tr("изменён", "edited"))
             } else {
                 name.clone()
             });
@@ -1244,7 +1292,7 @@ impl Ui {
             let ftag = FACTORY_BASE + *num as isize;
             let it = send!(menu, "itemWithTag:", ftag => isize; -> Id);
             let t = ns(&if self.au_modified && ftag == tag {
-                format!("{name} (изменён)")
+                format!("{name} ({})", tr("изменён", "edited"))
             } else {
                 name.clone()
             });
@@ -1258,11 +1306,11 @@ impl Ui {
 
     /// Write the plugin's current state as `<name>.aupreset` in the user preset folder.
     fn write_preset(&mut self, name: &str) -> Result<(), String> {
-        let a = self.pipe.au().ok_or("плагин не загружен")?;
+        let a = self.pipe.au().ok_or(tr("плагин не загружен", "the plugin is not loaded"))?;
         let bytes = a
             .handle()
             .export_preset(name)
-            .ok_or("плагин не отдал своё состояние")?;
+            .ok_or(tr("плагин не отдал своё состояние", "the plugin did not return its state"))?;
         let dir = preset_dir(&a.name);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(dir.join(format!("{name}.aupreset")), bytes).map_err(|e| e.to_string())?;
@@ -1297,6 +1345,15 @@ extern "C" fn on_toggle_popover(_: Id, _: Sel, _: Id) {
 
 extern "C" fn on_popover_closed(_: Id, _: Sel, _: Id) {
     with_ui(|ui| ui.closed_at = Some(Instant::now()));
+}
+
+extern "C" fn on_popover_shown(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let active = send!(ns_app(), "isActive"; -> ObjcBool) == YES;
+        let win = ui.popover_window();
+        let key = !win.is_null() && send!(win, "isKeyWindow"; -> ObjcBool) == YES;
+        log(&format!("popover shown: app active={active} key={key}"));
+    });
 }
 
 extern "C" fn on_rebuild(_: Id, _: Sel, _: Id) {
@@ -1370,6 +1427,18 @@ extern "C" fn on_select_effect(_: Id, _: Sel, sender: Id) {
     });
 }
 
+extern "C" fn on_select_lang(_: Id, _: Sel, sender: Id) {
+    let seg = unsafe { send!(sender, "selectedSegment"; -> isize) };
+    let lang = if seg == 1 { Lang::En } else { Lang::Ru };
+    LANG_EN.store(lang == Lang::En, Relaxed);
+    with_ui(|ui| unsafe {
+        ui.cfg.lang = Some(lang);
+        ui.save();
+        ui.update_icon();
+        ui.schedule_rebuild();
+    });
+}
+
 extern "C" fn on_toggle_idle_surface(_: Id, _: Sel, sender: Id) {
     let on = unsafe { send!(sender, "state"; -> isize) } != 0;
     log(&format!("idle surface: {on}"));
@@ -1422,7 +1491,7 @@ extern "C" fn on_save_builtin_preset(_: Id, _: Sel, _: Id) {
                 ui.builtin_user[i].1 = ui.pipe.params.values();
                 ui.refresh_preset_choice();
             }
-            Err(e) => notify_error("Не удалось сохранить пресет", &e.to_string()),
+            Err(e) => notify_error(tr("Не удалось сохранить пресет", "Could not save the preset"), &e.to_string()),
         }
     });
 }
@@ -1433,21 +1502,27 @@ extern "C" fn on_save_builtin_preset_as(_: Id, _: Sel, _: Id) {
         let default = ui
             .selected_user_preset()
             .map(|i| ui.builtin_user[i].0.clone())
-            .unwrap_or_else(|| "Мой пресет".into());
+            .unwrap_or_else(|| tr("Мой пресет", "My Preset").into());
         let Some(name) = prompt(
-            "Сохранить пресет Vinylizer",
-            &format!("Текущие настройки сохранятся в {}.", dir.display()),
+            tr("Сохранить пресет Vinylizer", "Save Vinylizer Preset"),
+            &match lang() {
+                Lang::Ru => format!("Текущие настройки сохранятся в {}.", dir.display()),
+                Lang::En => format!("The current settings will be saved to {}.", dir.display()),
+            },
             &default,
-            "Сохранить",
+            tr("Сохранить", "Save"),
         ) else {
             return;
         };
 
         if user_preset_path(&dir, &name).exists()
             && !confirm(
-                &format!("Заменить \u{201c}{name}\u{201d}?"),
-                "Пресет с таким именем уже есть.",
-                "Заменить",
+                &match lang() {
+                    Lang::Ru => format!("Заменить \u{201c}{name}\u{201d}?"),
+                    Lang::En => format!("Replace \u{201c}{name}\u{201d}?"),
+                },
+                tr("Пресет с таким именем уже есть.", "A preset with this name already exists."),
+                tr("Заменить", "Replace"),
             )
         {
             return;
@@ -1461,7 +1536,7 @@ extern "C" fn on_save_builtin_preset_as(_: Id, _: Sel, _: Id) {
                 ui.save();
                 ui.schedule_rebuild();
             }
-            Err(e) => notify_error("Не удалось сохранить пресет", &e.to_string()),
+            Err(e) => notify_error(tr("Не удалось сохранить пресет", "Could not save the preset"), &e.to_string()),
         }
     });
 }
@@ -1474,9 +1549,12 @@ extern "C" fn on_delete_builtin_preset(_: Id, _: Sel, _: Id) {
         let name = ui.builtin_user[i].0.clone();
         let path = user_preset_path(&user_preset_dir(), &name);
         if !confirm(
-            &format!("Удалить пресет \u{201c}{name}\u{201d}?"),
-            "Файл будет перемещён в Корзину. Текущие настройки останутся как есть.",
-            "В Корзину",
+            &match lang() {
+                Lang::Ru => format!("Удалить пресет \u{201c}{name}\u{201d}?"),
+                Lang::En => format!("Delete the preset \u{201c}{name}\u{201d}?"),
+            },
+            tr("Файл будет перемещён в Корзину. Текущие настройки останутся как есть.", "The file will be moved to the Trash. The current settings stay as they are."),
+            tr("В Корзину", "Move to Trash"),
         ) {
             return;
         }
@@ -1488,7 +1566,7 @@ extern "C" fn on_delete_builtin_preset(_: Id, _: Sel, _: Id) {
             ui.save();
             ui.schedule_rebuild();
         } else {
-            notify_error("Не удалось удалить пресет", &path.display().to_string());
+            notify_error(tr("Не удалось удалить пресет", "Could not delete the preset"), &path.display().to_string());
         }
     });
 }
@@ -1652,7 +1730,7 @@ extern "C" fn on_save_preset(_: Id, _: Sel, _: Id) {
         log(&format!("save preset {name}: {r:?}"));
         match r {
             Ok(()) => ui.refresh_au_preset(),
-            Err(e) => notify_error("Не удалось сохранить пресет", &e),
+            Err(e) => notify_error(tr("Не удалось сохранить пресет", "Could not save the preset"), &e),
         }
     });
 }
@@ -1666,24 +1744,33 @@ extern "C" fn on_save_preset_as(_: Id, _: Sel, _: Id) {
             .au_preset
             .as_ref()
             .map(|n| format!("{n} 2"))
-            .unwrap_or_else(|| "Мой пресет".into());
+            .unwrap_or_else(|| tr("Мой пресет", "My Preset").into());
         let Some(name) = prompt(
-            "Сохранить пресет плагина",
-            &format!(
-                "Файл ляжет в {} — его увидят и сам плагин, Logic и GarageBand.",
-                dir.display()
-            ),
+            tr("Сохранить пресет плагина", "Save Plugin Preset"),
+            &match lang() {
+                Lang::Ru => format!(
+                    "Файл ляжет в {} — его увидят и сам плагин, Logic и GarageBand.",
+                    dir.display()
+                ),
+                Lang::En => format!(
+                    "Saved to {} — also visible in the plugin, Logic and GarageBand.",
+                    dir.display()
+                ),
+            },
             &default,
-            "Сохранить",
+            tr("Сохранить", "Save"),
         ) else {
             return;
         };
 
         if dir.join(format!("{name}.aupreset")).exists()
             && !confirm(
-                &format!("Заменить \u{201c}{name}\u{201d}?"),
-                "Пресет с таким именем уже есть.",
-                "Заменить",
+                &match lang() {
+                    Lang::Ru => format!("Заменить \u{201c}{name}\u{201d}?"),
+                    Lang::En => format!("Replace \u{201c}{name}\u{201d}?"),
+                },
+                tr("Пресет с таким именем уже есть.", "A preset with this name already exists."),
+                tr("Заменить", "Replace"),
             )
         {
             return;
@@ -1693,7 +1780,7 @@ extern "C" fn on_save_preset_as(_: Id, _: Sel, _: Id) {
         log(&format!("save preset as {name}: {r:?}"));
         match r {
             Ok(()) => ui.schedule_rebuild(),
-            Err(e) => notify_error("Не удалось сохранить пресет", &e),
+            Err(e) => notify_error(tr("Не удалось сохранить пресет", "Could not save the preset"), &e),
         }
     });
 }
@@ -1707,9 +1794,12 @@ extern "C" fn on_delete_preset(_: Id, _: Sel, _: Id) {
             return;
         };
         if !confirm(
-            &format!("Удалить пресет \u{201c}{name}\u{201d}?"),
-            "Файл будет перемещён в Корзину.",
-            "В Корзину",
+            &match lang() {
+                Lang::Ru => format!("Удалить пресет \u{201c}{name}\u{201d}?"),
+                Lang::En => format!("Delete the preset \u{201c}{name}\u{201d}?"),
+            },
+            tr("Файл будет перемещён в Корзину.", "The file will be moved to the Trash."),
+            tr("В Корзину", "Move to Trash"),
         ) {
             return;
         }
@@ -1721,7 +1811,7 @@ extern "C" fn on_delete_preset(_: Id, _: Sel, _: Id) {
             ui.save();
             ui.schedule_rebuild();
         } else {
-            notify_error("Не удалось удалить пресет", &path.display().to_string());
+            notify_error(tr("Не удалось удалить пресет", "Could not delete the preset"), &path.display().to_string());
         }
     });
 }
@@ -1779,6 +1869,7 @@ unsafe fn make_controller() -> Id {
     let methods: &[(&CStr, extern "C" fn(Id, Sel, Id))] = &[
         (c"togglePopover:", on_toggle_popover),
         (c"popoverDidClose:", on_popover_closed),
+        (c"popoverDidShow:", on_popover_shown),
         (c"rebuild:", on_rebuild),
         (c"toggleEnabled:", on_toggle_enabled),
         (c"selectTarget:", on_select_target),
@@ -1786,6 +1877,7 @@ unsafe fn make_controller() -> Id {
         (c"selectEffect:", on_select_effect),
         (c"toggleBypass:", on_toggle_bypass),
         (c"toggleIdleSurface:", on_toggle_idle_surface),
+        (c"selectLang:", on_select_lang),
         (c"selectPreset:", on_select_preset),
         (c"saveBuiltinPreset:", on_save_builtin_preset),
         (c"saveBuiltinPresetAs:", on_save_builtin_preset_as),
@@ -1845,10 +1937,22 @@ unsafe fn make_popover(delegate: Id) -> (Id, Id) {
     (popover, scroll)
 }
 
-/// Dev aid: `VINYLIZER_SNAPSHOT=<dir>` renders the popover content in both modes to
-/// `<dir>/builtin.png` and `<dir>/plugin.png`, then exits. Settings are not saved.
+/// Dev aid: `VINYLIZER_SNAPSHOT=<dir>` renders the popover content in both modes and both
+/// languages to `<dir>/<mode>-<lang>.png`, then exits. Settings are not saved.
 unsafe fn snapshot(ui: &mut Ui, dir: &str) {
-    for (mode, name) in [(Mode::Builtin, "builtin"), (Mode::Plugin, "plugin")] {
+    let shots = [
+        (Mode::Builtin, Lang::Ru),
+        (Mode::Plugin, Lang::Ru),
+        (Mode::Builtin, Lang::En),
+        (Mode::Plugin, Lang::En),
+    ];
+    for (mode, lang) in shots {
+        LANG_EN.store(lang == Lang::En, Relaxed);
+        let name = format!(
+            "{}-{}",
+            if mode == Mode::Builtin { "builtin" } else { "plugin" },
+            lang.code()
+        );
         ui.cfg.mode = mode;
         ui.cfg.enabled = true;
         let _ = ui.pipe.apply(&ui.cfg);
@@ -1892,6 +1996,8 @@ pub fn run() {
         let mut cfg = Settings::load(&cfg_path, &params);
         // The UI offers exactly two modes; chaining stays a CLI option.
         cfg.chain = false;
+        let lang = cfg.lang.unwrap_or_else(|| system_lang());
+        LANG_EN.store(lang == Lang::En, Relaxed);
         let pipe = Pipeline::new(params);
 
         // Start near the clock (distance from the right edge, in points) unless the user
