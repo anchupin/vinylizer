@@ -29,10 +29,10 @@ CLI OPTIONS:
                        (e.g. com.spotify.client); default: all system audio
   --preset <name>      built-in preset: new | subtle | warm | worn | single | shellac | jazz | sinatra | jazz78
                        (default: warm)
-  --set <k>=<v>        override a built-in parameter, repeatable
-                       (wet age crackle crackle_level clicks click_level scratches wow noise
-                       drive width gain 0..2,
-                       rpm 0=33⅓ 1=45 2=78)
+  --set <k>=<v>        override a built-in parameter, repeatable; all 0..1 except
+                       gain 0..2 and rpm 0=33⅓ 1=45 2=78:
+                       wet year age crackle crackle_level clicks pops scratches click_level
+                       noise surface_gain wow drive color width gain rpm
   --au <name>          host an Audio Unit effect instead of the built-in DSP (e.g. \"Vinyl\")
   --chain              with --au: run the built-in DSP after the AU as well
   --idle               keep crackle and noise going while nothing plays
