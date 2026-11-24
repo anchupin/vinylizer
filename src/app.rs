@@ -29,7 +29,8 @@ CLI OPTIONS:
   --preset <name>      built-in preset: new | subtle | warm | worn | single | shellac | jazz | sinatra | jazz78
                        (default: warm)
   --set <k>=<v>        override a built-in parameter, repeatable
-                       (wet age crackle wow noise drive width gain 0..2, rpm 0=33⅓ 1=45 2=78)
+                       (wet age crackle crackle_level wow noise drive width gain 0..2,
+                       rpm 0=33⅓ 1=45 2=78)
   --au <name>          host an Audio Unit effect instead of the built-in DSP (e.g. \"Vinyl\")
   --chain              with --au: run the built-in DSP after the AU as well
   --list-devices       list output devices

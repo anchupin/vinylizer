@@ -20,7 +20,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vinylizer::params::{Params, DEFAULT_PRESET, PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS};
+use vinylizer::params::{
+    crackle_peak_db, Params, DEFAULT_PRESET, PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS,
+};
 use vinylizer::settings::{
     log, save_user_preset, support_dir, user_preset_dir, user_preset_path, user_presets as builtin_user_presets,
     Mode, Settings,
@@ -557,6 +559,7 @@ fn format_builtin(name: &str, v: f32) -> String {
             }
         }
         "width" if v < 0.005 => "моно".into(),
+        "crackle_level" => format!("{:.0} dB", crackle_peak_db(v)),
         _ => format!("{:.0}%", v * 100.0),
     }
 }

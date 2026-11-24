@@ -19,7 +19,7 @@
 //! but eat headroom and pump the speaker's limiter), and noise stays below ~7 kHz,
 //! where SBC/AAC encode noise-like content cleanly.
 
-use crate::params::Params;
+use crate::params::{crackle_peak_db, Params};
 use std::f32::consts::{PI, TAU};
 
 const DELAY_LEN: usize = 8192; // power of two; ~43 ms @ 192 kHz
@@ -38,6 +38,8 @@ const PRE_EMPH_DB: f32 = 8.0;
 const MONO_BASS_HZ: f32 = 150.0;
 /// Measured RMS of the raw groove-noise generator (see `noise_generator_rms` test).
 const NOISE_GEN_RMS: f32 = 0.273;
+/// Output peak of the loudest dust tick per unit of click amplitude (see `tick_peak` test).
+const TICK_PEAK: f32 = 1.1;
 
 const VOICES: usize = 16;
 const SCRATCHES: usize = 4;
@@ -239,6 +241,7 @@ struct Snapshot {
     wet: f32,
     age: f32,
     crackle: f32,
+    crackle_level: f32,
     wow: f32,
     noise: f32,
     drive: f32,
@@ -352,6 +355,7 @@ impl Vinyl {
             wet: params.wet.get(),
             age: params.age.get(),
             crackle: params.crackle.get(),
+            crackle_level: params.crackle_level.get(),
             wow: params.wow.get(),
             noise: params.noise.get(),
             drive: params.drive.get(),
@@ -391,13 +395,15 @@ impl Vinyl {
         self.sat_inv_k = 1.0 / self.sat_k;
         self.sat_c2 = 0.14 * p.drive * (1.0 + p.age);
 
-        // Crackle: ticks up to ~25/s, pops up to ~0.4/s, dense quiet fizz, 0..4 scratches.
+        // Crackle amount sets how many: ticks up to ~25/s, pops up to ~0.4/s, dense quiet fizz,
+        // 0..4 scratches. Crackle level alone sets how loud: the loudest dust ticks peak there,
+        // most are up to 30 dB quieter, pops and scratches up to ~6 dB louder.
         let c = p.crackle;
         self.tick_p = (c.powf(1.5) * 25.0) / fs;
         self.pop_p = (c * 0.4) / fs;
         self.fizz_p = (c * 300.0) / fs;
-        self.click_lvl = 0.12 * c;
         self.n_scratches = ((c * SCRATCHES as f32).round() as usize).min(SCRATCHES);
+        self.click_lvl = 10f32.powf(crackle_peak_db(p.crackle_level) / 20.0) / TICK_PEAK;
 
         // Groove noise from about -72 dBFS RMS (new record) to -42 dBFS (worn out).
         self.noise_lvl = if p.noise > 0.0 {
@@ -907,6 +913,43 @@ mod tests {
         let total = rms(out[48_000..].iter().map(|s| s.0));
         let low = rms(out.iter().map(|s| b.tick(a.tick(s.0))).skip(48_000));
         assert!(low < total * 0.05, "below 60 Hz {low} vs total {total}");
+    }
+
+    /// Peak of dust ticks alone (no pops, fizz or scratches) over a minute.
+    fn dust_tick_peak(level: f32) -> f32 {
+        let fs = 48_000.0;
+        let mut v = Vinyl::new(fs as f64);
+        v.update(&clean(&[("crackle", 1.0), ("crackle_level", level)]));
+        v.pop_p = 0.0;
+        v.fizz_p = 0.0;
+        v.n_scratches = 0;
+        let out = run(&mut v, 48_000 * 60, |_| 0.0);
+        out.iter().fold(0f32, |m, (l, r)| m.max(l.abs()).max(r.abs()))
+    }
+
+    #[test]
+    fn tick_peak() {
+        let db = |x: f32| 20.0 * x.log10();
+        let target = crackle_peak_db(0.53);
+        let got = db(dust_tick_peak(0.53));
+        assert!((got - target).abs() < 1.5, "loudest ticks {got:.1} dBFS, want {target:.1}");
+    }
+
+    #[test]
+    fn crackle_level_scales_loudness_not_count() {
+        let fs = 48_000.0;
+        let render = |level: f32| {
+            let mut v = Vinyl::new(fs as f64);
+            v.update(&clean(&[("crackle", 0.6), ("crackle_level", level)]));
+            run(&mut v, 48_000 * 5, |_| 0.0)
+        };
+        let (quiet, loud) = (render(0.2), render(0.8));
+
+        // Same random stream, so the louder render is the quieter one scaled up.
+        let k = 10f32.powf((crackle_peak_db(0.8) - crackle_peak_db(0.2)) / 20.0);
+        for (q, l) in quiet.iter().zip(&loud) {
+            assert!((q.0 * k - l.0).abs() <= 1e-4 + 1e-3 * l.0.abs(), "{} vs {}", q.0 * k, l.0);
+        }
     }
 
     #[test]
