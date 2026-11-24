@@ -45,6 +45,22 @@ fn main() {
     }
 
     let db = |x: f32| 20.0 * x.log10();
+
+    // Timeline: loud events (≥ -20 dBFS) in each second of the first minute.
+    if std::env::var("TIMELINE").is_ok() {
+        let mut per_sec = vec![0u32; 60];
+        let mut i = 0;
+        while i < env.len().min(fs as usize * 60) {
+            if db(env[i]) >= -20.0 {
+                per_sec[i / fs as usize] += 1;
+                i += gap;
+            } else {
+                i += 1;
+            }
+        }
+        println!("loud events per second: {per_sec:?}");
+    }
+
     print!("events/s by peak:");
     for th in [-40.0, -30.0, -20.0, -12.0, -6.0] {
         let n = events.iter().filter(|&&p| db(p) >= th).count();

@@ -19,7 +19,7 @@
 //! but eat headroom and pump the speaker's limiter), and noise stays below ~7 kHz,
 //! where SBC/AAC encode noise-like content cleanly.
 
-use crate::params::{crackle_peak_db, Params};
+use crate::params::{crackle_bed_db, crackle_peak_db, Params};
 use std::f32::consts::{PI, TAU};
 
 const DELAY_LEN: usize = 8192; // power of two; ~43 ms @ 192 kHz
@@ -37,11 +37,12 @@ const PRE_EMPH_DB: f32 = 8.0;
 /// Below this a cutting lathe sums the channels to mono.
 const MONO_BASS_HZ: f32 = 150.0;
 /// Measured RMS of the raw groove-noise generator (see `noise_generator_rms` test).
-const NOISE_GEN_RMS: f32 = 0.273;
-/// Output peak of the loudest dust tick per unit of click amplitude (see `tick_peak` test).
+const NOISE_GEN_RMS: f32 = 1.053;
+/// Output peak per unit of amplitude: of the smallest dust ticks and of the biggest pops
+/// (interpolated in between), and of scratches (see the `dust_levels` tests).
 const TICK_PEAK: f32 = 0.94;
-/// Output peak of the loudest click per unit of click amplitude (see `click_peak` test).
-const CLICK_PEAK: f32 = 0.88;
+const POP_PEAK: f32 = 1.13;
+const SCRATCH_PEAK: f32 = 0.88;
 
 const VOICES: usize = 16;
 const SCRATCHES: usize = 4;
@@ -109,6 +110,21 @@ impl Biquad {
             1.0 + alpha,
             -2.0 * c,
             1.0 - alpha,
+        );
+    }
+
+    /// RBJ peaking EQ: `gain_db` at `f`, width set by `q`.
+    pub fn peaking(&mut self, fs: f32, f: f32, q: f32, gain_db: f32) {
+        let a = 10f32.powf(gain_db / 40.0);
+        let (c, s) = Self::w0(fs, f);
+        let alpha = s / (2.0 * q);
+        self.set(
+            1.0 + alpha * a,
+            -2.0 * c,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * c,
+            1.0 - alpha / a,
         );
     }
 
@@ -207,25 +223,55 @@ struct Scratch {
 /// Groove noise colour: mostly low-mid "roar" with some hiss, nothing below 150 Hz.
 #[derive(Clone, Copy, Default)]
 struct NoiseShaper {
-    body: OnePole,
-    hiss: OnePole,
-    low_cut: [OnePole; 2],
+    /// Paul Kellet's economy pink filter state.
+    pink: [f32; 3],
+    top: [OnePole; 2],
+    /// 18 dB/oct: pink noise carries a lot of deep bass the speaker can't play.
+    low_cut: [OnePole; 3],
 }
 
 impl NoiseShaper {
+    /// Matched to a real LP's silent groove: pink (flat per octave) from the low mids to 4 kHz,
+    /// about −6 dB at 8 kHz and falling fast above; nothing below ~100 Hz.
     fn set(&mut self, fs: f32) {
-        self.body.set_lp(fs, 1_500.0);
-        self.hiss.set_lp(fs, 6_500.0);
+        self.top[0].set_lp(fs, 6_000.0);
+        self.top[1].set_lp(fs, 10_000.0);
         for f in &mut self.low_cut {
-            f.set_lp(fs, 150.0);
+            f.set_lp(fs, 120.0);
         }
     }
 
     #[inline(always)]
     fn shape(&mut self, white: f32) -> f32 {
-        let y = self.body.lp(white) + 0.35 * self.hiss.lp(white);
+        let p = &mut self.pink;
+        p[0] = 0.99765 * p[0] + white * 0.099_046;
+        p[1] = 0.963 * p[1] + white * 0.296_516_4;
+        p[2] = 0.57 * p[2] + white * 1.052_691_3;
+        let pink = p[0] + p[1] + p[2] + white * 0.1848;
+
+        let y = self.top[0].lp(pink);
+        let y = self.top[1].lp(y);
         let y = self.low_cut[0].hp(y);
-        self.low_cut[1].hp(y)
+        let y = self.low_cut[1].hp(y);
+        self.low_cut[2].hp(y)
+    }
+}
+
+/// The surface bus after the dust: only a low cut for the speaker. The click shape itself
+/// (a ~2 kHz ring of about 1.4 ms, as measured on a real record) is set per event.
+#[derive(Clone, Copy, Default)]
+struct ClickTone {
+    low_cut: Biquad,
+}
+
+impl ClickTone {
+    fn set(&mut self, fs: f32) {
+        self.low_cut.highpass(fs, 150.0, 0.707);
+    }
+
+    #[inline(always)]
+    fn tick(&mut self, x: f32) -> f32 {
+        self.low_cut.tick(x)
     }
 }
 
@@ -238,20 +284,28 @@ struct Chan {
     dc: OnePole,
     lp1: Biquad,
     lp2: Biquad,
+    /// Era: the band and mid character a record of that year was made with.
+    era_hp: Biquad,
+    era_lp: Biquad,
+    era_mid: Biquad,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 struct Snapshot {
     wet: f32,
+    year: f32,
     age: f32,
     crackle: f32,
     crackle_level: f32,
     clicks: f32,
+    pops: f32,
     click_level: f32,
     scratches: f32,
     wow: f32,
     noise: f32,
+    surface_gain: f32,
     drive: f32,
+    color: f32,
     width: f32,
     rpm: usize,
 }
@@ -262,6 +316,8 @@ pub struct Vinyl {
     p: Snapshot,
     ch: [Chan; 2],
     side_hp: Biquad,
+    /// Color: low-mid lift, presence dip, soft top, per channel, on everything that comes out.
+    tone: [[Biquad; 3]; 2],
     dl: [Box<[f32]>; 2],
     w: usize,
     base_delay: f32,
@@ -286,10 +342,15 @@ pub struct Vinyl {
     voices: [Voice; VOICES],
     next_voice: usize,
     tick_p: f32,
-    tick_lvl: f32,
-    click_p: f32,
+    /// Amplitude of the quietest dust events: the background.
+    bed_amp: f32,
+    /// 1/α of the power law: the louder an event, the rarer, by (amplitude ratio)^−α.
+    inv_alpha: f32,
+    /// Per-sample chance of a big-particle pop.
+    pop_p: f32,
     fizz_p: f32,
     fizz_lvl: f32,
+    /// Amplitude ceiling for dust events and scratches (the click peak).
     click_lvl: f32,
     density: f32,
     density_target: f32,
@@ -297,6 +358,7 @@ pub struct Vinyl {
     n_scratches: usize,
     // groove noise
     noise_mid: NoiseShaper,
+    click_tone: [ClickTone; 2],
     noise_side: NoiseShaper,
     noise_lvl: f32,
     /// Gain on crackle and groove noise, set per sample by a `SilenceGate`.
@@ -312,6 +374,7 @@ impl Vinyl {
             p: Snapshot::default(),
             ch: [Chan::default(); 2],
             side_hp: Biquad::default(),
+            tone: [[Biquad::default(); 3]; 2],
             dl: [
                 vec![0.0; DELAY_LEN].into_boxed_slice(),
                 vec![0.0; DELAY_LEN].into_boxed_slice(),
@@ -336,8 +399,9 @@ impl Vinyl {
             voices: [Voice::default(); VOICES],
             next_voice: 0,
             tick_p: 0.0,
-            tick_lvl: 0.0,
-            click_p: 0.0,
+            bed_amp: 0.0,
+            inv_alpha: 0.5,
+            pop_p: 0.0,
             fizz_p: 0.0,
             fizz_lvl: 0.0,
             click_lvl: 0.0,
@@ -346,12 +410,16 @@ impl Vinyl {
             scratches: [Scratch::default(); SCRATCHES],
             n_scratches: 0,
             noise_mid: NoiseShaper::default(),
+            click_tone: [ClickTone::default(); 2],
             noise_side: NoiseShaper::default(),
             noise_lvl: 0.0,
             surface: 1.0,
         };
         v.noise_mid.set(fs);
         v.noise_side.set(fs);
+        for t in &mut v.click_tone {
+            t.set(fs);
+        }
         v.recompute();
         v
     }
@@ -367,15 +435,19 @@ impl Vinyl {
         self.version = ver;
         self.p = Snapshot {
             wet: params.wet.get(),
+            year: params.year.get(),
             age: params.age.get(),
             crackle: params.crackle.get(),
             scratches: params.scratches.get(),
             crackle_level: params.crackle_level.get(),
             clicks: params.clicks.get(),
+            pops: params.pops.get(),
             click_level: params.click_level.get(),
             wow: params.wow.get(),
             noise: params.noise.get(),
+            surface_gain: params.surface_gain.get(),
             drive: params.drive.get(),
+            color: params.color.get(),
             width: params.width.get(),
             rpm: params.rpm_index().min(ROTATION_HZ.len() - 1),
         };
@@ -386,7 +458,7 @@ impl Vinyl {
         let fs = self.fs;
         let p = self.p;
 
-        let cutoff = 18_000.0 * (5_000.0f32 / 18_000.0).powf(p.age.powf(1.2));
+        let cutoff = cutoff_hz(p.age);
         for c in &mut self.ch {
             c.hp.highpass(fs, 28.0, 0.707);
             c.shelf.lowshelf(fs, 200.0, 2.5 * p.age);
@@ -395,14 +467,29 @@ impl Vinyl {
             c.dc.set_lp(fs, 8.0);
             c.lp1.lowpass(fs, cutoff, 0.6);
             c.lp2.lowpass(fs, cutoff * 1.15, 0.75);
+
+            // Era: older recordings and pressings had a narrower band and a forward mid.
+            let year = year_of(p.year);
+            c.era_hp.highpass(fs, era_hp_hz(year), 0.707);
+            c.era_lp.lowpass(fs, era_lp_hz(year), 0.707);
+            c.era_mid.peaking(fs, 2_000.0, 1.0, era_mid_db(year));
         }
         self.side_hp.highpass(fs, MONO_BASS_HZ, 0.707);
+
+        // Color: the warm vintage tone of the whole playback chain, so clicks and hiss get it
+        // too. At full: +3.5 dB below ~300 Hz, −2 dB at 3.5 kHz where digital sounds edgy,
+        // −4.5 dB above ~6 kHz.
+        for t in &mut self.tone {
+            t[0].lowshelf(fs, 300.0, 3.5 * p.color);
+            t[1].peaking(fs, 3_500.0, 0.8, -2.0 * p.color);
+            t[2].highshelf(fs, 6_000.0, -4.5 * p.color);
+        }
 
         // Wow comes from an off-centre hole, so it runs at the rotation rate.
         // Peak pitch deviation: wow up to 0.45 %, flutter up to 0.08 %.
         let rot_hz = ROTATION_HZ[p.rpm];
         self.rot_inc = rot_hz / fs;
-        self.wow_amp = p.wow * 0.0045 / (TAU * rot_hz) * fs;
+        self.wow_amp = wow_percent(p.wow) / 100.0 / (TAU * rot_hz) * fs;
         self.flut_amp = p.wow * 0.0008 / (TAU * 6.5) * fs;
 
         // Stylus: an even-order term sets the 2nd harmonic (about -40 dB at 1 kHz, -6 dBFS
@@ -412,30 +499,39 @@ impl Vinyl {
         self.sat_inv_k = 1.0 / self.sat_k;
         self.sat_c2 = 0.14 * p.drive * (1.0 + p.age);
 
-        // Fine crackle: ticks up to ~25/s and quiet fizz; its level is where the loudest ticks
-        // peak. Clicks: up to ~3/s, peaking at the click level. Scratches: 0..4 slots, as loud as
-        // clicks. Amounts set how many, levels how loud; neither affects the other.
+        // Dust is one stream of particles (up to ~25/s, plus quiet fizz). Their loudness follows
+        // a power law, as particle sizes do: nearly all sit at the background level, and the
+        // louder an event, the rarer it is. Clicks set how heavy that tail is; the click peak
+        // caps it, and scratches too. Raising the peak lets rare events get louder without
+        // touching the background.
         let c = p.crackle;
-        self.tick_p = (c.powf(1.5) * 25.0) / fs;
+        self.tick_p = crackle_per_s(c) / fs;
         self.fizz_p = (c * 300.0) / fs;
-        self.tick_lvl = 10f32.powf(crackle_peak_db(p.crackle_level) / 20.0) / TICK_PEAK;
-        self.click_p = (p.clicks.powf(1.5) * 3.0) / fs;
-        self.click_lvl = 10f32.powf(crackle_peak_db(p.click_level) / 20.0) / CLICK_PEAK;
-        self.n_scratches = if p.scratches > 0.0 {
-            ((p.scratches * SCRATCHES as f32).round() as usize).clamp(1, SCRATCHES)
-        } else {
-            0
-        };
+        // Both in output peak units; each event is scaled to its sound in `dust_particle`.
+        self.bed_amp = 10f32.powf(crackle_bed_db(p.crackle_level) / 20.0);
+        self.click_lvl = 10f32.powf(crackle_peak_db(p.click_level) / 20.0).max(self.bed_amp);
+        self.inv_alpha = 1.0 / click_tail(p.clicks);
+        self.pop_p = pops_per_s(p.pops) / fs;
+        self.n_scratches = scratch_slots(p.scratches);
 
         // Groove noise from about -72 dBFS RMS (new record) to -42 dBFS (worn out).
         // Fizz peaks a little above the noise it belongs to.
         let noise_rms = if p.noise > 0.0 {
-            10f32.powf((-72.0 + 30.0 * p.noise) / 20.0)
+            10f32.powf(noise_rms_db(p.noise) / 20.0)
         } else {
             0.0
         };
         self.noise_lvl = noise_rms / NOISE_GEN_RMS;
-        self.fizz_lvl = noise_rms * 4.0;
+        self.fizz_lvl = noise_rms * 1.5;
+
+        // Effects volume: everything added above moves by the same dB, as far as the loudest
+        // of it (the click peak) has headroom below 0 dBFS.
+        let peak_db = crackle_peak_db(p.click_level).max(crackle_bed_db(p.crackle_level));
+        let g = 10f32.powf(surface_offset_db(p.surface_gain, peak_db) / 20.0);
+        self.bed_amp *= g;
+        self.click_lvl *= g;
+        self.noise_lvl *= g;
+        self.fizz_lvl *= g;
     }
 
     #[inline(always)]
@@ -533,8 +629,52 @@ impl Vinyl {
     /// Revolutions until a scratch slot plays again: 5–40 s on a badly scratched record,
     /// up to about two minutes on a lightly scratched one.
     fn scratch_gap_revs(&mut self) -> u32 {
-        let secs = (5.0 + 35.0 * self.rand()) * (1.0 + 3.0 * (1.0 - self.p.scratches));
+        let secs = (5.0 + 35.0 * self.rand()) * scratch_gap_factor(self.p.scratches);
         (secs * ROTATION_HZ[self.p.rpm]) as u32
+    }
+
+    /// One dust particle hitting the stylus. Its loudness is Pareto-distributed from the
+    /// background level up to `ceiling`: P(louder than k × background) = k^−α. Bigger particles
+    /// also sound lower and longer: a fine tick, then a click with a small thud, then a dull pop.
+    #[inline(always)]
+    fn dust_particle(&mut self, ceiling: f32) {
+        let bed = self.bed_amp;
+        let a = (bed * self.rand().max(1.0e-6).powf(-self.inv_alpha)).min(ceiling);
+
+        // Where this event sits between the background and the ceiling, on a log scale (0..1).
+        let span = (ceiling / bed).ln();
+        let x = if span > 0.0 {
+            ((a / bed).ln() / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // From the wanted peak to the amplitude that gives it with this event's sound.
+        let a = a / (TICK_PEAK + (POP_PEAK - TICK_PEAK) * x);
+        let (gl, gr) = self.random_gains(0.6 - 0.3 * x);
+
+        // A real record's clicks ring around 2 kHz for about 1.4 ms (cartridge and RIAA treble
+        // pole together); bigger particles ring a little lower and longer, with a small thud.
+        let (f_lo, f_hi) = (1_600.0 - 400.0 * x, 2_800.0 - 600.0 * x);
+        let (tau_lo, tau_hi) = (0.00035 + 0.0001 * x, 0.0006 + 0.0002 * x);
+        self.trigger(a, f_lo, f_hi, tau_lo, tau_hi, gl, gr);
+        if x > 0.5 {
+            self.trigger(a * 0.3 * x, 200.0, 400.0, 0.0006, 0.0012, gl, gr);
+        }
+    }
+
+    /// A big particle: loud (0 to 9 dB under the click peak), lower and longer than dust —
+    /// a dull pop or a heavy click with a thud.
+    #[inline(always)]
+    fn big_pop(&mut self, ceiling: f32) {
+        let a = ceiling * 10f32.powf(-9.0 * self.rand() / 20.0) / POP_PEAK;
+        let (gl, gr) = self.random_gains(0.4);
+        if self.rand() < 0.5 {
+            self.trigger(a, 300.0, 900.0, 0.0005, 0.0012, gl, gr);
+        } else {
+            self.trigger(a, 1_100.0, 1_900.0, 0.0005, 0.0009, gl, gr);
+            self.trigger(a * 0.4, 180.0, 350.0, 0.0008, 0.0015, gl, gr);
+        }
     }
 
     /// Returns (left, right) crackle contribution. `prev` is the rotation phase before this sample.
@@ -556,7 +696,7 @@ impl Vinyl {
                 // The stylus jumping the scratch edge: a sharp tick, then the dull "tock" that
                 // RIAA playback EQ makes of it by lifting the bass. The tock dies out within about
                 // half a cycle, so it thuds instead of ringing into a pitched "bloop".
-                let a = lvl * s.amp * (0.75 + 0.5 * self.rand());
+                let a = lvl / SCRATCH_PEAK * s.amp * (0.75 + 0.5 * self.rand());
                 self.trigger(a, s.freq * 0.85, s.freq * 1.15, 0.00008, 0.0002, s.gl, s.gr);
                 self.trigger(a * 0.5, 150.0, 300.0, 0.0007, 0.0014, s.gl, s.gr);
             }
@@ -569,26 +709,15 @@ impl Vinyl {
         self.density += (self.density_target - self.density) * 1.0e-5;
         let dn = self.density;
 
+        // Big particles are a population of their own: rare, loud, near the click peak.
+        if self.pop_p > 0.0 && self.rand() < self.pop_p {
+            self.big_pop(lvl);
+        }
+
         let u = self.rand();
-        if u < self.click_p * dn {
-            // A distinct click: similar loudness every time (within 6 dB). Mostly a sharp tick
-            // with a small thud under it, sometimes a duller pop.
-            let a = lvl * (0.5 + 0.5 * self.rand());
-            let (gl, gr) = self.random_gains(0.5);
-            if self.rand() < 0.7 {
-                self.trigger(a, 1_500.0, 5_000.0, 0.00006, 0.00015, gl, gr);
-                self.trigger(a * 0.3, 200.0, 400.0, 0.0006, 0.0012, gl, gr);
-            } else {
-                self.trigger(a, 300.0, 1_000.0, 0.0004, 0.001, gl, gr);
-            }
-        } else if u < (self.click_p + self.tick_p) * dn {
-            // Fine crackle: ticks barely ring (about one cycle), so they click rather than "plip";
-            // amplitude log-distributed over ~30 dB, mostly faint (as before crackle and clicks
-            // were split, so the same settings sound the same).
-            let a = self.tick_lvl * 10f32.powf(-1.5 * self.rand());
-            let (gl, gr) = self.random_gains(0.6);
-            self.trigger(a, 2_500.0, 8_000.0, 0.00003, 0.0001, gl, gr);
-        } else if u < (self.click_p + self.tick_p + self.fizz_p) * dn {
+        if u < self.tick_p * dn {
+            self.dust_particle(lvl);
+        } else if u < (self.tick_p + self.fizz_p) * dn {
             // Fizz is surface texture: it sits at the groove-noise level, not the click level.
             let a = self.fizz_lvl * self.rand();
             let (gl, gr) = self.random_gains(1.0);
@@ -692,17 +821,22 @@ impl Vinyl {
             }
             s = self.ch[i].lp1.tick(s);
             s = self.ch[i].lp2.tick(s);
+            s = self.ch[i].era_hp.tick(s);
+            s = self.ch[i].era_lp.tick(s);
+            s = self.ch[i].era_mid.tick(s);
             x[i] = s;
         }
 
         // --- stereo: bass is always mono, as cut on a lathe
         let m = 0.5 * (x[0] + x[1]);
-        let sd = self.side_hp.tick(0.5 * (x[0] - x[1])) * p.width;
+        // Records before ~1958 are mono.
+        let sd = self.side_hp.tick(0.5 * (x[0] - x[1])) * p.width * era_stereo(year_of(p.year));
         let (mut wl, mut wr) = (m + sd, m - sd);
 
         // --- surface
-        if p.crackle > 0.0 || p.clicks > 0.0 || p.scratches > 0.0 {
+        if p.crackle > 0.0 || p.scratches > 0.0 || p.pops > 0.0 {
             let (cl, cr) = self.crackle(prev);
+            let (cl, cr) = (self.click_tone[0].tick(cl), self.click_tone[1].tick(cr));
             wl += cl * self.surface;
             wr += cr * self.surface;
         }
@@ -710,6 +844,16 @@ impl Vinyl {
             let (nl, nr) = self.groove_noise();
             wl += nl * self.surface;
             wr += nr * self.surface;
+        }
+
+        // --- color: the playback chain's tone, on music and surface alike
+        if p.color > 0.005 {
+            for f in &mut self.tone[0] {
+                wl = f.tick(wl);
+            }
+            for f in &mut self.tone[1] {
+                wr = f.tick(wr);
+            }
         }
 
         self.w = (w + 1) & DELAY_MASK;
@@ -783,6 +927,137 @@ impl SilenceGate {
     }
 }
 
+// What the 0..1 knobs mean in real units. The DSP and the UI's value labels both use these.
+
+/// The year for an era knob of 0..1: 1930 … 2000.
+pub fn year_of(era: f32) -> f32 {
+    1930.0 + 70.0 * era.clamp(0.0, 1.0)
+}
+
+/// Piecewise-linear lookup in a table of (year, value), flat outside it.
+fn by_year(year: f32, table: &[(f32, f32)]) -> f32 {
+    let (first, last) = (table[0], table[table.len() - 1]);
+    if year <= first.0 {
+        return first.1;
+    }
+    if year >= last.0 {
+        return last.1;
+    }
+
+    let i = table.iter().position(|(y, _)| *y > year).unwrap();
+    let ((y0, v0), (y1, v1)) = (table[i - 1], table[i]);
+    v0 + (v1 - v0) * (year - y0) / (y1 - y0)
+}
+
+/// Like `by_year` for frequencies: interpolates on a log scale. No allocation (runs on the
+/// audio thread when parameters change).
+fn by_year_log(year: f32, table: &[(f32, f32)]) -> f32 {
+    let mut log = [(0f32, 0f32); 8];
+    for (l, (y, f)) in log.iter_mut().zip(table) {
+        *l = (*y, f.ln());
+    }
+    by_year(year, &log[..table.len()]).exp()
+}
+
+/// Low end of the recorded band in a given year.
+pub fn era_hp_hz(year: f32) -> f32 {
+    by_year_log(
+        year,
+        &[(1930.0, 150.0), (1945.0, 120.0), (1955.0, 60.0), (1965.0, 40.0), (1975.0, 25.0), (2000.0, 20.0)],
+    )
+}
+
+/// Top of the recorded band in a given year.
+pub fn era_lp_hz(year: f32) -> f32 {
+    by_year_log(
+        year,
+        &[(1930.0, 4_500.0), (1945.0, 6_000.0), (1955.0, 10_000.0), (1965.0, 14_000.0), (1975.0, 18_000.0), (2000.0, 20_000.0)],
+    )
+}
+
+/// The forward, "radio" mid around 2 kHz of older records, dB.
+pub fn era_mid_db(year: f32) -> f32 {
+    by_year(year, &[(1930.0, 4.0), (1945.0, 3.0), (1955.0, 1.5), (1965.0, 0.5), (1975.0, 0.0)])
+}
+
+/// How much of the stereo image a record of that year has: mono up to 1955, stereo from 1960.
+pub fn era_stereo(year: f32) -> f32 {
+    by_year(year, &[(1955.0, 0.0), (1960.0, 1.0)])
+}
+
+/// Where the treble starts to roll off for a record wear of 0..1: 18 kHz new, 5 kHz worn out.
+pub fn cutoff_hz(age: f32) -> f32 {
+    18_000.0 * (5_000.0f32 / 18_000.0).powf(age.powf(1.2))
+}
+
+/// Peak pitch deviation of wow, in percent (up to ±0.45 %).
+pub fn wow_percent(wow: f32) -> f32 {
+    wow * 0.45
+}
+
+/// Fine crackle ticks per second on average (up to 25; patches of dust vary it 0.4–1.6×).
+pub fn crackle_per_s(crackle: f32) -> f32 {
+    crackle.powf(1.5) * 25.0
+}
+
+/// Big-particle pops per second for a pops knob of 0..1: up to one every 2 s; 0.22 is about
+/// one in 40 s.
+pub fn pops_per_s(pops: f32) -> f32 {
+    pops * pops * 0.5
+}
+
+/// Power-law exponent α of dust loudness for a clicks knob of 0..1: 3 (loud clicks are very
+/// rare, each +6 dB is 8× rarer) down to 1.2 (each +6 dB only 2.3× rarer).
+pub fn click_tail(clicks: f32) -> f32 {
+    3.0 - 1.8 * clicks
+}
+
+/// Dust louder than the background by this much counts as a click.
+pub const CLICK_ABOVE_BED_DB: f32 = 15.0;
+
+/// Share of dust particles that are clicks, i.e. at least `CLICK_ABOVE_BED_DB` louder than the
+/// background (before the click peak caps them).
+pub fn click_share(clicks: f32) -> f32 {
+    10f32.powf(-CLICK_ABOVE_BED_DB * click_tail(clicks) / 20.0)
+}
+
+/// Scratches that can be ticking at the same time (0..4).
+pub fn scratch_slots(scratches: f32) -> usize {
+    if scratches > 0.0 {
+        ((scratches * SCRATCHES as f32).round() as usize).clamp(1, SCRATCHES)
+    } else {
+        0
+    }
+}
+
+/// How much longer the pause between scratches gets on a lightly scratched record (1..4×).
+fn scratch_gap_factor(scratches: f32) -> f32 {
+    1.0 + 3.0 * (1.0 - scratches)
+}
+
+/// Average time between new scratches showing up, in seconds; `None` with scratches off.
+pub fn scratch_interval_s(scratches: f32) -> Option<f32> {
+    let slots = scratch_slots(scratches);
+    // Each slot waits 5–40 s (22.5 s on average) times the gap factor.
+    (slots > 0).then(|| 22.5 * scratch_gap_factor(scratches) / slots as f32)
+}
+
+/// Average groove noise level, dBFS RMS (−72 to −42).
+pub fn noise_rms_db(noise: f32) -> f32 {
+    -72.0 + 30.0 * noise
+}
+
+/// The effects-volume knob (0..1) as asked: −24 to +24 dB, 0 dB in the middle.
+pub fn surface_knob_db(knob: f32) -> f32 {
+    -24.0 + 48.0 * knob
+}
+
+/// The offset actually applied to crackle, clicks and noise: what the knob asks, but no more
+/// than the headroom the loudest of them (the click peak, `peak_db`) has below 0 dBFS.
+pub fn surface_offset_db(knob: f32, peak_db: f32) -> f32 {
+    surface_knob_db(knob).min(-peak_db)
+}
+
 /// Transparent below 0.9, then bends smoothly to a ceiling of 1.0, so clicks on top of
 /// a loud master never hard-clip in the codec or the speaker.
 #[inline(always)]
@@ -810,13 +1085,16 @@ mod tests {
         let p = Params::new();
         for (k, val) in [
             ("wet", 1.0),
+            ("year", 1.0),
             ("age", 0.0),
             ("crackle", 0.0),
             ("clicks", 0.0),
+            ("pops", 0.0),
             ("scratches", 0.0),
             ("noise", 0.0),
             ("wow", 0.0),
             ("drive", 0.0),
+            ("color", 0.0),
             ("width", 1.0),
             ("rpm", 0.0),
         ] {
@@ -1065,63 +1343,95 @@ mod tests {
         assert!(low < total * 0.05, "below 60 Hz {low} vs total {total}");
     }
 
-    /// Peak in dBFS over a minute of silence with only the given sources on (no fizz).
-    fn crackle_peak_db_of(overrides: &[(&str, f32)]) -> f32 {
-        let mut v = Vinyl::new(48_000.0);
+    /// Peaks (dBFS) of the dust events in two minutes of silence: everything within 10 ms of
+    /// crossing −90 dBFS is one event. No fizz, scratches or noise.
+    fn dust_events(overrides: &[(&str, f32)]) -> Vec<f32> {
+        let fs = 48_000.0;
+        let mut v = Vinyl::new(fs as f64);
         v.update(&clean(overrides));
         v.fizz_p = 0.0;
-        let out = run(&mut v, 48_000 * 60, |_| 0.0);
-        let peak = out.iter().fold(0f32, |m, (l, r)| m.max(l.abs()).max(r.abs()));
-        20.0 * peak.log10()
+        let env: Vec<f32> = run(&mut v, 48_000 * 120, |_| 0.0)
+            .iter()
+            .map(|(l, r)| l.abs().max(r.abs()))
+            .collect();
+
+        let gap = (0.01 * fs) as usize;
+        let mut events = Vec::new();
+        let mut i = 0;
+        while i < env.len() {
+            if env[i] > 3.2e-5 {
+                let end = (i + gap).min(env.len());
+                events.push(20.0 * env[i..end].iter().copied().fold(0f32, f32::max).log10());
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        events
+    }
+
+    fn count_above(events: &[f32], db: f32) -> usize {
+        events.iter().filter(|&&e| e >= db).count()
+    }
+
+    fn median(events: &[f32]) -> f32 {
+        let mut e = events.to_vec();
+        e.sort_by(f32::total_cmp);
+        e[e.len() / 2]
     }
 
     #[test]
-    fn tick_peak() {
-        let target = crackle_peak_db(0.5);
-        let got = crackle_peak_db_of(&[("crackle", 1.0), ("crackle_level", 0.5)]);
-        assert!((got - target).abs() < 1.5, "loudest ticks {got:.1} dBFS, want {target:.1}");
+    fn dust_levels_louder_is_rarer() {
+        // Background at −40 dBFS, a moderate tail, ceiling at 0 dBFS.
+        let e = dust_events(&[("crackle", 1.0), ("crackle_level", 0.5), ("clicks", 0.5), ("click_level", 1.0)]);
+        let bands: Vec<usize> = [-40.0, -30.0, -20.0, -10.0]
+            .iter()
+            .map(|&db| count_above(&e, db))
+            .collect();
+        for w in bands.windows(2) {
+            assert!(w[1] * 3 < w[0], "each 10 dB louder should be several times rarer: {bands:?}");
+        }
+        assert!(bands[3] > 0, "the tail still reaches loud clicks: {bands:?}");
     }
 
     #[test]
-    fn click_peak() {
-        let target = crackle_peak_db(0.5);
-        let got = crackle_peak_db_of(&[("clicks", 1.0), ("click_level", 0.5)]);
-        assert!((got - target).abs() < 1.5, "loudest clicks {got:.1} dBFS, want {target:.1}");
-    }
-
-    /// The louder render is the quieter one scaled up: same random stream, only the level differs.
-    fn assert_level_only_scales(amount: &str, level: &str) {
-        let render = |lvl: f32| {
-            let mut v = Vinyl::new(48_000.0);
-            v.update(&clean(&[(amount, 0.8), (level, lvl)]));
-            run(&mut v, 48_000 * 5, |_| 0.0)
-        };
-        let (quiet, loud) = (render(0.2), render(0.8));
-
-        let k = 10f32.powf((crackle_peak_db(0.8) - crackle_peak_db(0.2)) / 20.0);
-        for (q, l) in quiet.iter().zip(&loud) {
-            assert!((q.0 * k - l.0).abs() <= 1e-4 + 1e-3 * l.0.abs(), "{amount}: {} vs {}", q.0 * k, l.0);
+    fn dust_levels_background_follows_its_knob() {
+        // The typical event sits just above the background level, whatever the ceiling.
+        for (bed, peak) in [(0.3, 1.0), (0.5, 1.0), (0.5, 0.6), (0.8, 1.0)] {
+            let e = dust_events(&[("crackle", 1.0), ("crackle_level", bed), ("clicks", 0.3), ("click_level", peak)]);
+            let want = crackle_bed_db(bed);
+            let got = median(&e);
+            assert!((got - want).abs() < 4.0, "bed {bed}: median {got:.1} dBFS, want ≈{want:.1}");
         }
     }
 
     #[test]
-    fn levels_scale_loudness_not_count() {
-        assert_level_only_scales("crackle", "crackle_level");
-        assert_level_only_scales("clicks", "click_level");
+    fn dust_levels_click_peak_is_a_ceiling() {
+        // A heavy tail hits the ceiling often; nothing goes past it.
+        let e = dust_events(&[("crackle", 1.0), ("crackle_level", 0.5), ("clicks", 1.0), ("click_level", 0.5)]);
+        let loudest = e.iter().copied().fold(f32::MIN, f32::max);
+        let ceiling = crackle_peak_db(0.5);
+        assert!(loudest <= ceiling + 1.5, "loudest {loudest:.1} dBFS over the {ceiling} ceiling");
+        assert!(loudest >= ceiling - 3.0, "loudest {loudest:.1} dBFS never reaches {ceiling}");
     }
 
     #[test]
-    fn crackle_and_clicks_are_independent() {
-        // The click level does nothing to crackle alone, and vice versa.
-        let crackle = |click_level: f32| {
-            crackle_peak_db_of(&[("crackle", 1.0), ("crackle_level", 0.5), ("click_level", click_level)])
-        };
-        assert_eq!(crackle(0.0), crackle(1.0));
-        let clicks = |crackle_level: f32| {
-            crackle_peak_db_of(&[("clicks", 1.0), ("click_level", 0.5), ("crackle_level", crackle_level)])
-        };
-        assert_eq!(clicks(0.0), clicks(1.0));
+    fn more_clicks_means_more_loud_events_same_background() {
+        let few = dust_events(&[("crackle", 1.0), ("crackle_level", 0.5), ("clicks", 0.1), ("click_level", 1.0)]);
+        let many = dust_events(&[("crackle", 1.0), ("crackle_level", 0.5), ("clicks", 0.9), ("click_level", 1.0)]);
+        assert!(count_above(&many, -20.0) > 5 * count_above(&few, -20.0).max(1));
+        assert!((median(&many) - median(&few)).abs() < 4.0, "the background barely moves");
     }
+
+    #[test]
+    fn click_share_matches_the_events() {
+        // The share shown next to the slider is what comes out (above background + 15 dB).
+        let e = dust_events(&[("crackle", 1.0), ("crackle_level", 0.5), ("clicks", 0.5), ("click_level", 1.0)]);
+        let got = count_above(&e, crackle_bed_db(0.5) + CLICK_ABOVE_BED_DB) as f32 / e.len() as f32;
+        let want = click_share(0.5);
+        assert!((got / want).log2().abs() < 1.0, "share {got:.4}, want ≈{want:.4}");
+    }
+
 
     /// Gate gain after feeding `secs` of a constant input level.
     fn feed(g: &mut SilenceGate, secs: f32, level: f32) -> f32 {
@@ -1156,6 +1466,104 @@ mod tests {
 
         let music = run(&mut v, 48_000, |i| (TAU * 1_000.0 * i as f32 / fs).sin() * 0.5);
         assert!(rms(music[24_000..].iter().map(|s| s.0)) > 0.3);
+    }
+
+    #[test]
+    fn effects_volume_moves_everything_together_up_to_the_headroom() {
+        let at = |knob: f32, peak: f32| {
+            let mut v = Vinyl::new(48_000.0);
+            v.update(&clean(&[
+                ("crackle", 0.5),
+                ("crackle_level", 0.5),
+                ("click_level", peak),
+                ("noise", 0.5),
+                ("surface_gain", knob),
+            ]));
+            (v.bed_amp, v.click_lvl, v.noise_lvl)
+        };
+        let db = |x: f32| 20.0 * x.log10();
+
+        // −6 dB on the knob: every level drops by 6 dB, the balance stays.
+        let (b0, c0, n0) = at(0.5, 0.5);
+        let (b1, c1, n1) = at(0.375, 0.5);
+        for (a, b) in [(b0, b1), (c0, c1), (n0, n1)] {
+            assert!((db(b) - db(a) - -6.0).abs() < 0.01);
+        }
+
+        // +24 dB asked with the click peak at −20 dBFS: only the 20 dB of headroom is used.
+        let (b2, c2, _) = at(1.0, 0.5);
+        assert!((db(c2) - 0.0).abs() < 0.01, "the click peak stops at 0 dBFS");
+        assert!((db(b2) - db(b0) - 20.0).abs() < 0.01, "the background moves by the same 20 dB");
+
+        // With the peak already at 0 dBFS there is nothing to add.
+        assert_eq!(surface_offset_db(1.0, 0.0), 0.0);
+    }
+
+    /// Output RMS of a 0.5 sine through the effect with the given overrides.
+    fn sine_rms(freq: f32, overrides: &[(&str, f32)]) -> f32 {
+        let fs = 48_000.0;
+        let mut v = Vinyl::new(fs as f64);
+        v.update(&clean(overrides));
+        let out = run(&mut v, 48_000, |i| (TAU * freq * i as f32 / fs).sin() * 0.5);
+        rms(out[24_000..].iter().map(|s| s.0))
+    }
+
+    #[test]
+    fn era_narrows_old_records_and_leaves_new_ones_alone() {
+        let db = |a: f32, b: f32| 20.0 * (a / b).log10();
+        let at = |year: f32, freq: f32| db(sine_rms(freq, &[("year", year)]), sine_rms(freq, &[]));
+
+        // 1930s: no top, forward mid.
+        assert!(at(0.0, 10_000.0) < -15.0, "1930 top: {:.1} dB", at(0.0, 10_000.0));
+        assert!(at(0.0, 2_000.0) > 2.0, "1930 mid: {:.1} dB", at(0.0, 2_000.0));
+        // 2000: nothing changes.
+        for f in [200.0, 2_000.0, 10_000.0] {
+            assert!(at(1.0, f).abs() < 0.5, "2000 at {f} Hz: {:.1} dB", at(1.0, f));
+        }
+    }
+
+    #[test]
+    fn records_before_the_late_fifties_are_mono() {
+        let side = |year: f32| {
+            let fs = 48_000.0;
+            let mut v = Vinyl::new(fs as f64);
+            v.update(&clean(&[("year", year)]));
+            let out: Vec<(f32, f32)> = (0..48_000)
+                .map(|i| {
+                    let s = (TAU * 1_000.0 * i as f32 / fs).sin() * 0.5;
+                    v.tick(s, -s)
+                })
+                .collect();
+            rms(out[24_000..].iter().map(|(l, r)| 0.5 * (l - r)))
+        };
+        assert!(side(0.3) < 0.001, "1951: no side signal");
+        assert!(side(0.6) > 0.3, "1972: stereo");
+    }
+
+    #[test]
+    fn color_warms_the_music() {
+        let db = |a: f32, b: f32| 20.0 * (a / b).log10();
+        let lift = |freq: f32| db(sine_rms(freq, &[("color", 1.0)]), sine_rms(freq, &[]));
+
+        assert!(lift(200.0) > 1.5, "low mids up: {:.1} dB", lift(200.0));
+        assert!(lift(3_500.0) < -1.0, "presence down: {:.1} dB", lift(3_500.0));
+        assert!(lift(12_000.0) < -3.0, "top down: {:.1} dB", lift(12_000.0));
+        assert!(lift(1_000.0).abs() < 1.5, "mids stay: {:.1} dB", lift(1_000.0));
+    }
+
+    #[test]
+    fn color_also_softens_the_surface() {
+        // Crackle goes through the same chain: with color its highs drop too.
+        let hiss_top = |color: f32| {
+            let fs = 48_000.0;
+            let mut v = Vinyl::new(fs as f64);
+            v.update(&clean(&[("crackle", 1.0), ("crackle_level", 0.8), ("color", color)]));
+            let out = run(&mut v, 96_000, |_| 0.0);
+            let mut hp = Biquad::default();
+            hp.highpass(fs, 8_000.0, 0.707);
+            rms(out.iter().map(|s| hp.tick(s.0)))
+        };
+        assert!(hiss_top(1.0) < hiss_top(0.0) * 0.8);
     }
 
     #[test]

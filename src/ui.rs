@@ -20,9 +20,15 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vinylizer::dsp::{
+    click_share, crackle_per_s, cutoff_hz, era_hp_hz, era_lp_hz, era_stereo, noise_rms_db, pops_per_s,
+    scratch_interval_s, surface_knob_db, year_of,
+    surface_offset_db, wow_percent,
+};
 use vinylizer::i18n::Lang;
 use vinylizer::params::{
-    crackle_peak_db, Params, DEFAULT_PRESET, PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS,
+    crackle_bed_db, crackle_peak_db, v2_condition_label, v2_values, Params, V2Style, DEFAULT_PRESET,
+    PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS,
 };
 use vinylizer::settings::{
     log, save_user_preset, support_dir, user_preset_dir, user_preset_path, user_presets as builtin_user_presets,
@@ -78,8 +84,8 @@ const W: f64 = 400.0;
 const PAD: f64 = 16.0;
 const FIELD_X: f64 = 120.0;
 const SLIDER_X: f64 = 160.0;
-const VALUE_W: f64 = 58.0;
-const MAX_H: f64 = 820.0;
+const VALUE_W: f64 = 72.0;
+const MAX_H: f64 = 920.0;
 
 // Tags in the plugin preset pop-up.
 const NO_PRESET: isize = -1;
@@ -124,6 +130,9 @@ struct Controls {
     au_save: Id,
     au_delete: Id,
     au_rows: Vec<AuRow>,
+    /// V2: (slider, value label) for condition and level, and the summary lines.
+    v2_sliders: [(Id, Id); 4],
+    v2_summary: Vec<Id>,
 }
 
 impl Default for Controls {
@@ -143,6 +152,8 @@ impl Default for Controls {
             au_save: null,
             au_delete: null,
             au_rows: Vec::new(),
+            v2_sliders: [(null, null); 4],
+            v2_summary: Vec::new(),
         }
     }
 }
@@ -162,6 +173,8 @@ struct Ui {
     c: Controls,
     /// The user's presets for the built-in effect: (name, values).
     builtin_user: Vec<(String, Vec<f32>)>,
+    /// The user's own built-in values while V2 plays its fixed ones.
+    v1_stash: Option<Vec<f32>>,
     plugin_window: Id,
     au_presets: Vec<(i32, String)>,
     au_user_presets: Vec<(String, PathBuf)>,
@@ -576,8 +589,24 @@ fn user_presets(component_name: &str) -> Vec<(String, PathBuf)> {
 }
 
 /// Built-in parameter value as shown next to its slider.
-fn format_builtin(name: &str, v: f32) -> String {
+fn format_builtin(name: &str, v: f32, params: &Params) -> String {
     match name {
+        "surface_gain" => {
+            // What is applied: the knob, capped by the click peak's headroom.
+            let peak = crackle_peak_db(params.click_level.get())
+                .max(crackle_bed_db(params.crackle_level.get()));
+            let applied = surface_offset_db(v, peak);
+            let shown = if applied.abs() < 0.5 {
+                "0 dB".to_string()
+            } else {
+                format!("{applied:+.0} dB")
+            };
+            if surface_knob_db(v) > applied + 0.5 {
+                format!("{} {:+.0}", tr("макс", "max"), applied)
+            } else {
+                shown
+            }
+        }
         "gain" if v <= 0.001 => "−∞ dB".into(),
         "gain" => {
             let db = 20.0 * v.log10();
@@ -588,8 +617,51 @@ fn format_builtin(name: &str, v: f32) -> String {
             }
         }
         "width" if v < 0.005 => tr("моно", "mono").into(),
-        "crackle_level" | "click_level" => format!("{:.0} dB", crackle_peak_db(v)),
+        "crackle_level" => format!("{:.0} dB", crackle_bed_db(v)),
+        "click_level" => format!("{:.0} dB", crackle_peak_db(v)),
+        "clicks" => format!("1 {} {:.0}", tr("из", "in"), 1.0 / click_share(v)),
+        "noise" if v <= 0.0 => tr("нет", "off").into(),
+        "noise" => format!("{:.0} dB", noise_rms_db(v)),
+        "age" => decimal(&format!("{:.1} {}", cutoff_hz(v) / 1000.0, tr("кГц", "kHz"))),
+        "wow" => decimal(&format!("±{:.2}%", wow_percent(v))),
+        "crackle" => per_second(crackle_per_s(v)),
+        "year" => format!("{:.0}", year_of(v)),
+        "pops" => match pops_per_s(v) {
+            r if r <= 0.0 => tr("нет", "off").into(),
+            r => interval(1.0 / r),
+        },
+        "scratches" => match scratch_interval_s(v) {
+            None => tr("нет", "off").into(),
+            Some(s) => interval(s),
+        },
         _ => format!("{:.0}%", v * 100.0),
+    }
+}
+
+/// An average interval as "~40 s" or "~2.5 min".
+fn interval(secs: f32) -> String {
+    if secs < 90.0 {
+        format!("~{secs:.0} {}", tr("с", "s"))
+    } else {
+        decimal(&format!("~{:.1} {}", secs / 60.0, tr("мин", "min")))
+    }
+}
+
+/// A rate as "1.4/s" ("1,4/с" in Russian); whole numbers from 10 up.
+fn per_second(rate: f32) -> String {
+    let n = if rate >= 10.0 {
+        format!("{rate:.0}")
+    } else {
+        format!("{rate:.1}")
+    };
+    decimal(&format!("{n}/{}", tr("с", "s")))
+}
+
+/// Russian uses a decimal comma.
+fn decimal(s: &str) -> String {
+    match lang() {
+        Lang::Ru => s.replace('.', ","),
+        Lang::En => s.to_string(),
     }
 }
 
@@ -597,8 +669,45 @@ fn format_builtin(name: &str, v: f32) -> String {
 
 impl Ui {
     fn save(&mut self) {
-        let _ = self.cfg.save(&self.cfg_path, &self.pipe.params);
+        // In V2 the live values are the fixed V2 ones; the file keeps the user's own.
+        let r = match &self.v1_stash {
+            Some(own) => {
+                let p = Params::new();
+                p.apply_values(own);
+                p.idle_surface
+                    .store(self.pipe.params.idle_surface.load(Relaxed), Relaxed);
+                self.cfg.save(&self.cfg_path, &p)
+            }
+            None => self.cfg.save(&self.cfg_path, &self.pipe.params),
+        };
+        let _ = r;
         self.dirty = false;
+    }
+
+    /// Switch modes. Entering V2 puts the user's own values aside and plays the fixed V2
+    /// ones; leaving it brings the user's values back.
+    fn set_mode(&mut self, mode: Mode) {
+        match (self.cfg.mode == Mode::V2, mode == Mode::V2) {
+            (false, true) => self.enter_v2(),
+            (true, false) => {
+                if let Some(own) = self.v1_stash.take() {
+                    self.pipe.params.apply_values(&own);
+                }
+            }
+            _ => {}
+        }
+        self.cfg.mode = mode;
+    }
+
+    fn enter_v2(&mut self) {
+        self.v1_stash = Some(self.pipe.params.values());
+        self.apply_v2();
+    }
+
+    /// Play the V2 sound for the current V2 knobs.
+    fn apply_v2(&self) {
+        let v = v2_values(self.cfg.v2_condition, self.cfg.v2_level, self.cfg.v2_color, self.cfg.v2_era, self.cfg.v2_style);
+        self.pipe.params.apply_values(&v);
     }
 
     fn apply(&mut self) {
@@ -811,6 +920,7 @@ impl Ui {
         self.build_header(&mut r);
         match self.cfg.mode {
             Mode::Builtin => self.build_builtin(&mut r),
+            Mode::V2 => self.build_v2(&mut r),
             Mode::Plugin => self.build_plugin(&mut r),
         }
         r.rule();
@@ -879,10 +989,18 @@ impl Ui {
 
         // ---- mode
         let mode = match self.cfg.mode {
-            Mode::Builtin => 0,
-            Mode::Plugin => 1,
+            Mode::V2 => 0,
+            Mode::Builtin => 1,
+            Mode::Plugin => 2,
         };
-        let seg = segmented(&["Vinylizer", tr("Сторонний плагин", "Third-party plugin")], mode, c, c"selectMode:");
+        let seg = segmented(&["V2", "Vinylizer", tr("Плагин", "Plugin")], mode, c, c"selectMode:");
+        set_tooltip(
+            seg,
+            tr(
+                "V2 — готовый звук без настроек; Vinylizer — всё вручную; Плагин — сторонний AU",
+                "V2 — a ready sound, no knobs; Vinylizer — everything by hand; Plugin — a third-party AU",
+            ),
+        );
         r.field(tr("Режим", "Mode"), seg, W - FIELD_X - PAD);
 
         let idle = checkbox(
@@ -963,7 +1081,7 @@ impl Ui {
                 v as f64,
                 0.0,
                 max,
-                &format_builtin(key, v),
+                &format_builtin(key, v, &params),
                 c"sliderChanged:",
             );
         }
@@ -976,6 +1094,213 @@ impl Ui {
             }
         }
         self.refresh_builtin();
+    }
+
+    /// V2: two knobs and a summary of what they make.
+    unsafe fn build_v2(&mut self, r: &mut Rows) {
+        let c = self.controller;
+
+        r.put(
+            text(
+                tr(
+                    "Готовый звук под Emberton III: хорошая вертушка, 33⅓",
+                    "A ready sound for the Emberton III: a good turntable, 33⅓",
+                ),
+                11.0,
+                false,
+                true,
+            ),
+            PAD,
+            0.0,
+            W - 2.0 * PAD,
+            15.0,
+        );
+        r.y += 22.0;
+
+        let style = popup(c, c"selectV2Style:", false);
+        for (i, s) in V2Style::ALL.iter().enumerate() {
+            popup_add(style, s.label().get(lang()), i as isize);
+        }
+        let current = V2Style::ALL.iter().position(|s| *s == self.cfg.v2_style).unwrap_or(0);
+        popup_select_tag(style, current as isize);
+        set_tooltip(
+            style,
+            tr(
+                "Джаз: поношенная пластинка, стерео уже. Рок: почище, ярче, фон и шум +6 dB",
+                "Jazz: a played record, narrower stereo. Rock: cleaner, brighter, background and hiss +6 dB",
+            ),
+        );
+        let bp = checkbox(tr("Без эффекта", "Bypass"), self.pipe.params.bypass.load(Relaxed), c, c"toggleBypass:");
+        set_tooltip(bp, tr("Сравнить с оригиналом: звук идёт мимо эффекта, пока галочка стоит", "Compare with the original: sound skips the effect while this is checked"));
+        r.put(bp, W - PAD - 104.0, 3.0, 104.0, 18.0);
+        self.c.bypass = bp;
+        r.field(tr("Стиль", "Style"), style, 140.0);
+        r.y += 4.0;
+
+        self.c.v2_sliders[0] = self.slider_row(
+            r,
+            0,
+            tr("Состояние", "Condition"),
+            Some(tr(
+                "Новая → заигранная: пыль, щелчки, шум, верха вместе",
+                "New → worn out: dust, clicks, hiss, treble together",
+            )),
+            self.cfg.v2_condition as f64,
+            0.0,
+            1.0,
+            "",
+            c"v2SliderChanged:",
+        );
+        self.c.v2_sliders[3] = self.slider_row(
+            r,
+            3,
+            tr("Эпоха", "Era"),
+            Some(tr(
+                "Звук записи своего времени: у старых уже полоса и моно",
+                "Sound of its time: older records are narrower and mono",
+            )),
+            self.cfg.v2_era as f64,
+            0.0,
+            1.0,
+            "",
+            c"v2SliderChanged:",
+        );
+        self.c.v2_sliders[1] = self.slider_row(
+            r,
+            1,
+            tr("Громкость эффектов", "Effects volume"),
+            Some(tr(
+                "Треск и шум вместе, баланс сохраняется",
+                "Crackle and hiss together, keeping their balance",
+            )),
+            self.cfg.v2_level as f64,
+            0.0,
+            1.0,
+            "",
+            c"v2SliderChanged:",
+        );
+        self.c.v2_sliders[2] = self.slider_row(
+            r,
+            2,
+            tr("Окраска", "Color"),
+            Some(tr(
+                "Тёплый винтажный тон всего звука: и музыки, и треска",
+                "Warm vintage tone of everything: music and crackle alike",
+            )),
+            self.cfg.v2_color as f64,
+            0.0,
+            1.0,
+            "",
+            c"v2SliderChanged:",
+        );
+
+        r.y += 4.0;
+        self.c.v2_summary = (0..4)
+            .map(|_| {
+                let l = text("", 11.0, false, true);
+                r.put(l, PAD, 0.0, W - 2.0 * PAD, 15.0);
+                r.y += 17.0;
+                l
+            })
+            .collect();
+        self.refresh_v2();
+    }
+
+    /// V2 value labels and the summary for the current knobs.
+    unsafe fn refresh_v2(&self) {
+        let [(_, cond_l), (_, level_l), (_, color_l), (_, era_l)] = self.c.v2_sliders;
+        if cond_l.is_null() {
+            return;
+        }
+
+        let v = v2_values(self.cfg.v2_condition, self.cfg.v2_level, self.cfg.v2_color, self.cfg.v2_era, self.cfg.v2_style);
+        let get = |name: &str| v[PARAM_NAMES.iter().position(|n| *n == name).unwrap()];
+        let p = Params::new();
+        p.apply_values(&v);
+        let year = year_of(get("year"));
+        let stereo = get("width") * era_stereo(year);
+
+        set_text(cond_l, v2_condition_label(self.cfg.v2_condition).get(lang()));
+        set_text(color_l, &format!("{:.0}%", self.cfg.v2_color * 100.0));
+        set_text(era_l, &format_builtin("year", self.cfg.v2_era, &p));
+        set_text(level_l, &format_builtin("surface_gain", self.cfg.v2_level, &p));
+
+        // What comes out, in the same units as the Vinylizer tab, after the effects volume.
+        let peak = crackle_peak_db(get("click_level")).max(crackle_bed_db(get("crackle_level")));
+        let off = surface_offset_db(self.cfg.v2_level, peak);
+        let lines = [
+            match lang() {
+                Lang::Ru => decimal(&format!(
+                    "Треск: {:.1} пылинки/с, фон {:.0} dB, пик щелчков {:.0} dB",
+                    crackle_per_s(get("crackle")),
+                    crackle_bed_db(get("crackle_level")) + off,
+                    peak + off
+                )),
+                Lang::En => format!(
+                    "Crackle: {:.1} particles/s, background {:.0} dB, click peak {:.0} dB",
+                    crackle_per_s(get("crackle")),
+                    crackle_bed_db(get("crackle_level")) + off,
+                    peak + off
+                ),
+            },
+            match lang() {
+                Lang::Ru => format!(
+                    "Щелчки 1 из {:.0}; хлопки {}; шум канавки {:.0} dB",
+                    1.0 / click_share(get("clicks")),
+                    interval(1.0 / pops_per_s(get("pops"))),
+                    noise_rms_db(get("noise")) + off
+                ),
+                Lang::En => format!(
+                    "Clicks 1 in {:.0}; pops {}; groove hiss {:.0} dB",
+                    1.0 / click_share(get("clicks")),
+                    interval(1.0 / pops_per_s(get("pops"))),
+                    noise_rms_db(get("noise")) + off
+                ),
+            },
+            match lang() {
+                Lang::Ru => decimal(&format!(
+                    "Полоса {:.0} Гц–{:.1} кГц; износ с {:.1} кГц; плавание ±{:.2}%",
+                    era_hp_hz(year),
+                    era_lp_hz(year) / 1000.0,
+                    cutoff_hz(get("age")) / 1000.0,
+                    wow_percent(get("wow"))
+                )),
+                Lang::En => format!(
+                    "Band {:.0} Hz–{:.1} kHz; wear from {:.1} kHz; wow ±{:.2}%",
+                    era_hp_hz(year),
+                    era_lp_hz(year) / 1000.0,
+                    cutoff_hz(get("age")) / 1000.0,
+                    wow_percent(get("wow"))
+                ),
+            },
+            match (lang(), stereo < 0.01) {
+                (Lang::Ru, true) => decimal(&format!(
+                    "Тон: низы +{:.1} dB, верха −{:.1} dB; моно, без царапин",
+                    3.5 * get("color"),
+                    4.5 * get("color")
+                )),
+                (Lang::Ru, false) => decimal(&format!(
+                    "Тон: низы +{:.1} dB, верха −{:.1} dB; стерео {:.0}%, без царапин",
+                    3.5 * get("color"),
+                    4.5 * get("color"),
+                    stereo * 100.0
+                )),
+                (Lang::En, true) => format!(
+                    "Tone: lows +{:.1} dB, highs −{:.1} dB; mono, no scratches",
+                    3.5 * get("color"),
+                    4.5 * get("color")
+                ),
+                (Lang::En, false) => format!(
+                    "Tone: lows +{:.1} dB, highs −{:.1} dB; stereo {:.0}%, no scratches",
+                    3.5 * get("color"),
+                    4.5 * get("color"),
+                    stereo * 100.0
+                ),
+            },
+        ];
+        for (l, t) in self.c.v2_summary.iter().zip(lines) {
+            set_text(*l, &t);
+        }
     }
 
     unsafe fn build_plugin(&mut self, r: &mut Rows) {
@@ -1174,17 +1499,31 @@ impl Ui {
 
         let params = &self.pipe.params;
         for (i, n) in PARAM_NAMES.iter().enumerate() {
-            let (slider, label) = self.c.sliders[i];
+            let (slider, _) = self.c.sliders[i];
             if slider.is_null() {
                 continue;
             }
             let v = params.get(n).unwrap_or(0.0);
             send!(slider, "setDoubleValue:", v as f64 => f64; -> ());
-            set_text(label, &format_builtin(n, v));
         }
+        self.refresh_value_labels();
         popup_select_tag(self.c.rpm, params.rpm_index() as isize);
         send!(self.c.bypass, "setState:", params.bypass.load(Relaxed) as isize => isize; -> ());
         self.refresh_preset_choice();
+    }
+
+    /// The values next to the sliders; one setting can change another's (the effects volume
+    /// depends on the click peak), so they are all redrawn together.
+    unsafe fn refresh_value_labels(&self) {
+        let params = &self.pipe.params;
+        for (i, n) in PARAM_NAMES.iter().enumerate() {
+            let Some(&(slider, label)) = self.c.sliders.get(i) else {
+                continue;
+            };
+            if !slider.is_null() {
+                set_text(label, &format_builtin(n, params.get(n).unwrap_or(0.0), params));
+            }
+        }
     }
 
     /// The user preset the current values match, if any.
@@ -1398,7 +1737,11 @@ extern "C" fn on_select_target(_: Id, _: Sel, sender: Id) {
 extern "C" fn on_select_mode(_: Id, _: Sel, sender: Id) {
     let seg = unsafe { send!(sender, "selectedSegment"; -> isize) };
     with_ui(|ui| {
-        ui.cfg.mode = if seg == 1 { Mode::Plugin } else { Mode::Builtin };
+        ui.set_mode(match seg {
+            0 => Mode::V2,
+            2 => Mode::Plugin,
+            _ => Mode::Builtin,
+        });
         ui.cfg.chain = false;
         // First time in plugin mode: take the first vinyl-like effect.
         if ui.cfg.mode == Mode::Plugin && ui.cfg.au.is_none() {
@@ -1620,6 +1963,42 @@ extern "C" fn on_select_rpm(_: Id, _: Sel, sender: Id) {
     });
 }
 
+extern "C" fn on_select_v2_style(_: Id, _: Sel, sender: Id) {
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
+    with_ui(|ui| unsafe {
+        let Some(&style) = V2Style::ALL.get(tag as usize) else {
+            return;
+        };
+        ui.cfg.v2_style = style;
+        (ui.cfg.v2_condition, ui.cfg.v2_level, ui.cfg.v2_era) = style.knobs();
+        ui.apply_v2();
+
+        let [(cond, _), (level, _), _, (era, _)] = ui.c.v2_sliders;
+        send!(cond, "setDoubleValue:", ui.cfg.v2_condition as f64 => f64; -> ());
+        send!(level, "setDoubleValue:", ui.cfg.v2_level as f64 => f64; -> ());
+        send!(era, "setDoubleValue:", ui.cfg.v2_era as f64 => f64; -> ());
+        ui.refresh_v2();
+        ui.save();
+    });
+}
+
+extern "C" fn on_v2_slider(_: Id, _: Sel, sender: Id) {
+    let (idx, v) = unsafe { (tag_of(sender), send!(sender, "doubleValue"; -> f64) as f32) };
+    with_ui(|ui| unsafe {
+        match idx {
+            0 => ui.cfg.v2_condition = v,
+            1 => ui.cfg.v2_level = v,
+            2 => ui.cfg.v2_color = v,
+            _ => ui.cfg.v2_era = v,
+        }
+        ui.apply_v2();
+        ui.refresh_v2();
+        ui.dirty = true;
+    });
+}
+
 extern "C" fn on_slider(_: Id, _: Sel, sender: Id) {
     unsafe {
         let idx = tag_of(sender) as usize;
@@ -1627,11 +2006,7 @@ extern "C" fn on_slider(_: Id, _: Sel, sender: Id) {
         with_ui(|ui| {
             let Some(n) = PARAM_NAMES.get(idx) else { return };
             let _ = ui.pipe.params.set(n, v);
-            if let Some(&(_, l)) = ui.c.sliders.get(idx) {
-                if !l.is_null() {
-                    set_text(l, &format_builtin(n, v));
-                }
-            }
+            ui.refresh_value_labels();
             ui.refresh_preset_choice();
             ui.dirty = true;
         });
@@ -1886,6 +2261,8 @@ unsafe fn make_controller() -> Id {
         (c"resetPlugin:", on_reset_plugin),
         (c"selectRpm:", on_select_rpm),
         (c"sliderChanged:", on_slider),
+        (c"v2SliderChanged:", on_v2_slider),
+        (c"selectV2Style:", on_select_v2_style),
         (c"openPluginUI:", on_open_plugin_ui),
         (c"selectAuPreset:", on_select_au_preset),
         (c"auSliderChanged:", on_au_slider),
@@ -1941,19 +2318,24 @@ unsafe fn make_popover(delegate: Id) -> (Id, Id) {
 /// languages to `<dir>/<mode>-<lang>.png`, then exits. Settings are not saved.
 unsafe fn snapshot(ui: &mut Ui, dir: &str) {
     let shots = [
+        (Mode::V2, Lang::Ru),
         (Mode::Builtin, Lang::Ru),
         (Mode::Plugin, Lang::Ru),
+        (Mode::V2, Lang::En),
         (Mode::Builtin, Lang::En),
-        (Mode::Plugin, Lang::En),
     ];
     for (mode, lang) in shots {
         LANG_EN.store(lang == Lang::En, Relaxed);
         let name = format!(
             "{}-{}",
-            if mode == Mode::Builtin { "builtin" } else { "plugin" },
+            match mode {
+                Mode::V2 => "v2",
+                Mode::Builtin => "builtin",
+                Mode::Plugin => "plugin",
+            },
             lang.code()
         );
-        ui.cfg.mode = mode;
+        ui.set_mode(mode);
         ui.cfg.enabled = true;
         let _ = ui.pipe.apply(&ui.cfg);
 
@@ -2049,6 +2431,7 @@ pub fn run() {
             apps: Vec::new(),
             c: Controls::default(),
             builtin_user: Vec::new(),
+            v1_stash: None,
             plugin_window: ptr::null_mut(),
             au_presets: Vec::new(),
             au_user_presets: Vec::new(),
@@ -2057,6 +2440,10 @@ pub fn run() {
             dirty: false,
             ticks: 0,
         };
+        // Started in V2: the file holds the user's own values; V2 plays its own.
+        if ui.cfg.mode == Mode::V2 {
+            ui.enter_v2();
+        }
         if let Ok(dir) = std::env::var("VINYLIZER_SNAPSHOT") {
             snapshot(&mut ui, &dir);
             ui.pipe.stop();

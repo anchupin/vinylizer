@@ -1,7 +1,9 @@
 //! Persistent user settings (simple `key=value` text file).
 
 use crate::i18n::Lang;
-use crate::params::{Params, PARAM_NAMES};
+use crate::params::{
+    Params, V2Style, PARAM_NAMES, V2_DEFAULT_COLOR, V2_DEFAULT_CONDITION, V2_DEFAULT_ERA,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -10,6 +12,8 @@ use std::sync::atomic::Ordering::Relaxed;
 pub enum Mode {
     /// Our own DSP (`dsp::Vinyl`) with its own presets.
     Builtin,
+    /// Our own DSP with fixed, curated settings (`params::V2_VALUES`), no knobs.
+    V2,
     /// A third-party Audio Unit (e.g. iZotope Vinyl) with its own parameters and presets.
     Plugin,
 }
@@ -30,6 +34,12 @@ pub struct Settings {
     pub preset: Option<String>,
     /// Interface language; `None` follows the system language.
     pub lang: Option<Lang>,
+    /// V2 knobs: record condition (0 new … 1 worn out) and effects volume (as `surface_gain`).
+    pub v2_condition: f32,
+    pub v2_level: f32,
+    pub v2_color: f32,
+    pub v2_era: f32,
+    pub v2_style: V2Style,
 }
 
 impl Default for Settings {
@@ -43,6 +53,11 @@ impl Default for Settings {
             au_preset: None,
             preset: None,
             lang: None,
+            v2_condition: V2_DEFAULT_CONDITION,
+            v2_level: 0.5,
+            v2_color: V2_DEFAULT_COLOR,
+            v2_era: V2_DEFAULT_ERA,
+            v2_style: V2Style::Plain,
         }
     }
 }
@@ -146,7 +161,7 @@ impl Settings {
     pub fn active_au(&self) -> Option<&str> {
         match self.mode {
             Mode::Plugin => self.au.as_deref(),
-            Mode::Builtin => None,
+            Mode::Builtin | Mode::V2 => None,
         }
     }
 
@@ -166,6 +181,7 @@ impl Settings {
                     mode = match v {
                         "plugin" => Some(Mode::Plugin),
                         "builtin" => Some(Mode::Builtin),
+                        "v2" => Some(Mode::V2),
                         _ => None,
                     }
                 }
@@ -173,6 +189,27 @@ impl Settings {
                 "au_preset" => s.au_preset = (!v.is_empty()).then(|| v.to_string()),
                 "preset" => s.preset = (!v.is_empty()).then(|| v.to_string()),
                 "lang" => s.lang = Lang::from_code(v),
+                "v2_condition" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        s.v2_condition = x.clamp(0.0, 1.0);
+                    }
+                }
+                "v2_style" => s.v2_style = V2Style::from_code(v).unwrap_or(V2Style::Plain),
+                "v2_era" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        s.v2_era = x.clamp(0.0, 1.0);
+                    }
+                }
+                "v2_color" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        s.v2_color = x.clamp(0.0, 1.0);
+                    }
+                }
+                "v2_level" => {
+                    if let Ok(x) = v.parse::<f32>() {
+                        s.v2_level = x.clamp(0.0, 1.0);
+                    }
+                }
                 "targets" => {
                     s.targets = v
                         .split(',')
@@ -202,6 +239,7 @@ impl Settings {
             self.lang.map_or("", Lang::code),
             match self.mode {
                 Mode::Builtin => "builtin",
+                Mode::V2 => "v2",
                 Mode::Plugin => "plugin",
             },
             self.chain as u8,
@@ -210,6 +248,14 @@ impl Settings {
             self.preset.as_deref().unwrap_or(""),
             self.targets.join(",")
         );
+        out.push_str(&format!(
+            "v2_style={}\nv2_condition={}\nv2_level={}\nv2_color={}\nv2_era={}\n",
+            self.v2_style.code(),
+            self.v2_condition,
+            self.v2_level,
+            self.v2_color,
+            self.v2_era
+        ));
         out.push_str(&format!(
             "idle_surface={}\n",
             params.idle_surface.load(Relaxed) as u8
@@ -249,6 +295,11 @@ mod tests {
             au_preset: Some("Jazz".into()),
             preset: Some("Пыльная 45".into()),
             lang: Some(Lang::En),
+            v2_condition: 0.7,
+            v2_level: 0.4,
+            v2_color: 0.8,
+            v2_era: 0.4,
+            v2_style: V2Style::Jazz,
         };
         let text = s.serialize(&p);
         let p2 = Params::new();
