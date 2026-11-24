@@ -104,6 +104,7 @@ pub struct AuParam {
     pub min: f32,
     pub max: f32,
     pub value: f32,
+    pub default: f32,
     pub unit: u32,
     pub flags: u32,
 }
@@ -422,6 +423,7 @@ impl AuHandle {
                         min: info.minValue,
                         max: info.maxValue,
                         value,
+                        default: info.defaultValue,
                         unit: info.unit,
                         flags: info.flags,
                     })

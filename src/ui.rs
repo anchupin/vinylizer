@@ -1,6 +1,9 @@
 #![allow(non_upper_case_globals)]
 //! Menu bar app (AppKit through the raw Objective-C runtime — no extra crates).
 //!
+//! The status item opens a transient popover: clicks inside keep it open,
+//! a click anywhere outside closes it.
+//!
 //! Everything here runs on the main thread. Audio runs on Core Audio's
 //! real-time thread and only shares the lock-free `Params` with the UI.
 
@@ -16,16 +19,44 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
-use vinylizer::params::{Params, PARAM_NAMES, PRESETS};
-use vinylizer::settings::{log, support_dir, Settings};
+use std::time::{Duration, Instant};
+use vinylizer::params::{Params, DEFAULT_PRESET, PARAM_INFO, PARAM_NAMES, PRESETS, RPM_LABELS};
+use vinylizer::settings::{
+    log, save_user_preset, support_dir, user_preset_dir, user_preset_path, user_presets as builtin_user_presets,
+    Mode, Settings,
+};
 
 #[cfg(target_arch = "aarch64")]
 const NO: ObjcBool = false;
 #[cfg(not(target_arch = "aarch64"))]
 const NO: ObjcBool = 0;
 
+#[cfg(target_arch = "aarch64")]
+const ALIGN_RIGHT: isize = 2;
+#[cfg(not(target_arch = "aarch64"))]
+const ALIGN_RIGHT: isize = 1;
+
+#[cfg(target_arch = "aarch64")]
+const BOOL_RET_TYPES: &CStr = c"B@:";
+#[cfg(not(target_arch = "aarch64"))]
+const BOOL_RET_TYPES: &CStr = c"c@:";
+
 const OWN_BUNDLE: &str = "dev.vinylizer";
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+// Popover geometry, points.
+const W: f64 = 400.0;
+const PAD: f64 = 16.0;
+const FIELD_X: f64 = 120.0;
+const SLIDER_X: f64 = 160.0;
+const VALUE_W: f64 = 58.0;
+const MAX_H: f64 = 720.0;
+
+// Tags in the plugin preset pop-up.
+const NO_PRESET: isize = -1;
+const FACTORY_BASE: isize = 100_000;
+// Tags in the built-in preset pop-up: shipped presets are 0.., the user's start here.
+const USER_BASE: isize = 1_000;
 
 struct AppEntry {
     root: String,
@@ -34,20 +65,76 @@ struct AppEntry {
     running: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum AuKind {
+    Slider,
+    Toggle,
+    Index,
+}
+
+/// One live control for a plugin parameter.
+struct AuRow {
+    kind: AuKind,
+    control: Id,
+    value: Id,
+}
+
+/// Controls of the currently built popover. All are owned by its view tree
+/// and are replaced together on every rebuild.
+struct Controls {
+    status: Id,
+    enabled: Id,
+    preset: Id,
+    preset_save: Id,
+    preset_delete: Id,
+    rpm: Id,
+    bypass: Id,
+    sliders: Vec<(Id, Id)>, // (slider, value label) per PARAM_NAMES entry; null for rpm
+    au_preset: Id,
+    au_save: Id,
+    au_delete: Id,
+    au_rows: Vec<AuRow>,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        let null = ptr::null_mut();
+        Self {
+            status: null,
+            enabled: null,
+            preset: null,
+            preset_save: null,
+            preset_delete: null,
+            rpm: null,
+            bypass: null,
+            sliders: Vec::new(),
+            au_preset: null,
+            au_save: null,
+            au_delete: null,
+            au_rows: Vec::new(),
+        }
+    }
+}
+
 struct Ui {
     pipe: Pipeline,
     cfg: Settings,
     cfg_path: PathBuf,
     controller: Id,
+    flipped: Id,
     status_item: Id,
+    popover: Id,
+    scroll: Id,
+    closed_at: Option<Instant>,
     effects: Vec<String>,
     apps: Vec<AppEntry>,
-    value_labels: Vec<Id>,
+    c: Controls,
+    /// The user's presets for the built-in effect: (name, values).
+    builtin_user: Vec<(String, Vec<f32>)>,
     plugin_window: Id,
     au_presets: Vec<(i32, String)>,
     au_user_presets: Vec<(String, PathBuf)>,
     au_params: Vec<au::AuParam>,
-    au_value_labels: Vec<Id>,
     au_modified: bool,
     dirty: bool,
     ticks: u64,
@@ -82,14 +169,6 @@ unsafe fn sel(name: &CStr) -> Sel {
     sel_registerName(name.as_ptr())
 }
 
-unsafe fn new_menu(title: &str) -> Id {
-    let t = ns(title);
-    let m =
-        send!(send!(class(c"NSMenu"), "alloc"; -> Id), "initWithTitle:", t.0 as Id => Id; -> Id);
-    send!(m, "setAutoenablesItems:", NO => ObjcBool; -> ());
-    send!(m, "autorelease"; -> Id)
-}
-
 unsafe fn menu_item(title: &str, action: Option<&CStr>, target: Id, tag: isize) -> Id {
     let t = ns(title);
     let key = ns("");
@@ -121,13 +200,115 @@ unsafe fn set_enabled(item: Id, on: bool) {
     send!(item, "setEnabled:", if on { YES } else { NO } => ObjcBool; -> ());
 }
 
-unsafe fn label(text: &str, frame: NSRect, size: f64) -> Id {
+unsafe fn set_text(field: Id, text: &str) {
     let t = ns(text);
+    send!(field, "setStringValue:", t.0 as Id => Id; -> ());
+}
+
+unsafe fn set_tooltip(view: Id, text: &str) {
+    let t = ns(text);
+    send!(view, "setToolTip:", t.0 as Id => Id; -> ());
+}
+
+unsafe fn small_font() -> Id {
+    send!(class(c"NSFont"), "systemFontOfSize:", 11.0f64 => f64; -> Id)
+}
+
+/// Text label; `secondary` uses the dimmed system colour.
+unsafe fn text(s: &str, size: f64, bold: bool, secondary: bool) -> Id {
+    let t = ns(s);
     let l = send!(class(c"NSTextField"), "labelWithString:", t.0 as Id => Id; -> Id);
-    send!(l, "setFrame:", frame => NSRect; -> ());
-    let font = send!(class(c"NSFont"), "systemFontOfSize:", size => f64; -> Id);
+    let font = if bold {
+        send!(class(c"NSFont"), "boldSystemFontOfSize:", size => f64; -> Id)
+    } else {
+        send!(class(c"NSFont"), "systemFontOfSize:", size => f64; -> Id)
+    };
     send!(l, "setFont:", font => Id; -> ());
+    if secondary {
+        let c = send!(class(c"NSColor"), "secondaryLabelColor"; -> Id);
+        send!(l, "setTextColor:", c => Id; -> ());
+    }
+    send!(l, "setLineBreakMode:", 4isize => isize; -> ()); // truncate tail
     l
+}
+
+unsafe fn small(control: Id) {
+    send!(control, "setControlSize:", 1isize => isize; -> ());
+    send!(control, "setFont:", small_font() => Id; -> ());
+}
+
+unsafe fn popup(target: Id, action: &CStr, pulls_down: bool) -> Id {
+    let p = send!(class(c"NSPopUpButton"), "alloc"; -> Id);
+    let p = send!(p, "initWithFrame:pullsDown:", NSRect::default() => NSRect, if pulls_down { YES } else { NO } => ObjcBool; -> Id);
+    send!(p, "setTarget:", target => Id; -> ());
+    send!(p, "setAction:", sel(action) => Sel; -> ());
+    small(p);
+    send!(p, "autorelease"; -> Id)
+}
+
+unsafe fn popup_add(p: Id, title: &str, tag: isize) -> Id {
+    let menu = send!(p, "menu"; -> Id);
+    add(menu, menu_item(title, None, ptr::null_mut(), tag))
+}
+
+unsafe fn popup_separator(p: Id) {
+    separator(send!(p, "menu"; -> Id));
+}
+
+unsafe fn popup_select_tag(p: Id, tag: isize) {
+    send!(p, "selectItemWithTag:", tag => isize; -> ObjcBool);
+}
+
+/// Tag of the item the user picked in a pop-up.
+unsafe fn selected_tag(p: Id) -> Option<isize> {
+    let it = send!(p, "selectedItem"; -> Id);
+    (!it.is_null()).then(|| tag_of(it))
+}
+
+unsafe fn button(title: &str, target: Id, action: &CStr) -> Id {
+    let t = ns(title);
+    let b = send!(class(c"NSButton"), "buttonWithTitle:target:action:", t.0 as Id => Id, target => Id, sel(action) => Sel; -> Id);
+    small(b);
+    b
+}
+
+unsafe fn checkbox(title: &str, on: bool, target: Id, action: &CStr) -> Id {
+    let t = ns(title);
+    let b = send!(class(c"NSButton"), "checkboxWithTitle:target:action:", t.0 as Id => Id, target => Id, sel(action) => Sel; -> Id);
+    small(b);
+    send!(b, "setState:", on as isize => isize; -> ());
+    b
+}
+
+unsafe fn on_off_switch(on: bool, target: Id, action: &CStr) -> Id {
+    let cls = class(c"NSSwitch");
+    if cls.is_null() {
+        return checkbox("", on, target, action);
+    }
+
+    let s = send!(send!(cls, "alloc"; -> Id), "initWithFrame:", NSRect::default() => NSRect; -> Id);
+    send!(s, "setTarget:", target => Id; -> ());
+    send!(s, "setAction:", sel(action) => Sel; -> ());
+    send!(s, "setControlSize:", 1isize => isize; -> ());
+    send!(s, "setState:", on as isize => isize; -> ());
+    send!(s, "autorelease"; -> Id)
+}
+
+unsafe fn segmented(labels: &[&str], selected: isize, target: Id, action: &CStr) -> Id {
+    let strings: Vec<cf::Cf> = labels.iter().map(|l| ns(l)).collect();
+    let ids: Vec<Id> = strings.iter().map(|s| s.0 as Id).collect();
+    let arr = send!(class(c"NSArray"), "arrayWithObjects:count:", ids.as_ptr() => *const Id, ids.len() => usize; -> Id);
+    let s = send!(class(c"NSSegmentedControl"), "segmentedControlWithLabels:trackingMode:target:action:",
+        arr => Id, 0usize => usize, target => Id, sel(action) => Sel; -> Id);
+    small(s);
+    send!(s, "setSelectedSegment:", selected => isize; -> ());
+    s
+}
+
+unsafe fn hline() -> Id {
+    let b = send!(send!(class(c"NSBox"), "alloc"; -> Id), "initWithFrame:", NSRect::default() => NSRect; -> Id);
+    send!(b, "setBoxType:", 2usize => usize; -> ()); // separator
+    send!(b, "autorelease"; -> Id)
 }
 
 unsafe fn ns_app() -> Id {
@@ -161,7 +342,7 @@ unsafe fn new_alert(title: &str, info: &str, buttons: &[&str]) -> Id {
 
 /// Modal text prompt; `None` if cancelled or empty.
 unsafe fn prompt(title: &str, info: &str, default: &str, ok: &str) -> Option<String> {
-    let alert = new_alert(title, info, &[ok, "Cancel"]);
+    let alert = new_alert(title, info, &[ok, "Отмена"]);
     let tf = send!(send!(class(c"NSTextField"), "alloc"; -> Id), "initWithFrame:", NSRect::new(0.0, 0.0, 280.0, 24.0) => NSRect; -> Id);
     let d = ns(default);
     send!(tf, "setStringValue:", d.0 as Id => Id; -> ());
@@ -181,7 +362,7 @@ unsafe fn prompt(title: &str, info: &str, default: &str, ok: &str) -> Option<Str
 }
 
 unsafe fn confirm(title: &str, info: &str, ok: &str) -> bool {
-    let alert = new_alert(title, info, &[ok, "Cancel"]);
+    let alert = new_alert(title, info, &[ok, "Отмена"]);
     let r = send!(alert, "runModal"; -> isize);
     send!(alert, "release"; -> ());
     r == 1000
@@ -200,6 +381,43 @@ unsafe fn trash(path: &std::path::Path) -> bool {
     let fm = send!(class(c"NSFileManager"), "defaultManager"; -> Id);
     send!(fm, "trashItemAtURL:resultingItemURL:error:", url => Id, ptr::null_mut::<c_void>() => Id, ptr::null_mut::<c_void>() => Id; -> ObjcBool)
         == YES
+}
+
+/// Lays views out top to bottom in a flipped container.
+struct Rows {
+    view: Id,
+    y: f64,
+}
+
+impl Rows {
+    unsafe fn put(&self, v: Id, x: f64, dy: f64, w: f64, h: f64) {
+        send!(v, "setFrame:", NSRect::new(x, self.y + dy, w, h) => NSRect; -> ());
+        send!(self.view, "addSubview:", v => Id; -> ());
+    }
+
+    /// Caption on the left, control in the field column.
+    unsafe fn field(&mut self, caption: &str, control: Id, w: f64) {
+        self.put(text(caption, 12.0, false, false), PAD, 4.0, FIELD_X - PAD, 17.0);
+        self.put(control, FIELD_X, 0.0, w, 24.0);
+        self.y += 30.0;
+    }
+
+    /// A row of buttons of the given widths, left to right from `x`, with a gap between them.
+    unsafe fn buttons(&mut self, x: f64, row: &[(Id, f64)]) {
+        const GAP: f64 = 8.0;
+        let mut x = x;
+        for &(b, w) in row {
+            self.put(b, x, 0.0, w, 24.0);
+            x += w + GAP;
+        }
+        self.y += 30.0;
+    }
+
+    unsafe fn rule(&mut self) {
+        self.y += 4.0;
+        self.put(hline(), PAD, 0.0, W - 2.0 * PAD, 1.0);
+        self.y += 9.0;
+    }
 }
 
 // ------------------------------------------------------------------ app list
@@ -284,10 +502,7 @@ fn preset_dir(component_name: &str) -> PathBuf {
 /// `.aupreset` files saved by hosts (Logic, GarageBand, …) for this plugin:
 /// `~/Library/Audio/Presets/<Manufacturer>/<Plugin>/` and the system-wide equivalent.
 fn user_presets(component_name: &str) -> Vec<(String, PathBuf)> {
-    let (manu, plug) = component_name
-        .split_once(':')
-        .map(|(m, p)| (m.trim(), p.trim()))
-        .unwrap_or(("", component_name));
+    let (manu, plug) = split_component(component_name);
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -329,6 +544,23 @@ fn user_presets(component_name: &str) -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Built-in parameter value as shown next to its slider.
+fn format_builtin(name: &str, v: f32) -> String {
+    match name {
+        "gain" if v <= 0.001 => "−∞ dB".into(),
+        "gain" => {
+            let db = 20.0 * v.log10();
+            if db.abs() < 0.05 {
+                "0 dB".into()
+            } else {
+                format!("{db:+.1} dB")
+            }
+        }
+        "width" if v < 0.005 => "моно".into(),
+        _ => format!("{:.0}%", v * 100.0),
+    }
+}
+
 // ------------------------------------------------------------------ Ui logic
 
 impl Ui {
@@ -339,31 +571,28 @@ impl Ui {
 
     fn apply(&mut self) {
         let current = self.pipe.au().map(|a| a.name.clone());
-        if current != self.cfg.au || !self.cfg.enabled {
-            // plugin instance may be replaced: its editor must go first
-            if current != self.cfg.au {
-                unsafe { self.close_plugin_window() };
-            }
+        // the plugin instance may be replaced: its editor must go first
+        if current.as_deref() != self.cfg.active_au() {
+            unsafe { self.close_plugin_window() };
         }
+
         let r = self.pipe.apply(&self.cfg);
         log(&format!(
-            "apply enabled={} targets={:?} au={:?} chain={} -> {:?} | {} | au_loaded={:?}",
+            "apply enabled={} mode={:?} targets={:?} au={:?} -> {:?} | {} | au_loaded={:?}",
             self.cfg.enabled,
+            self.cfg.mode,
             self.cfg.targets,
             self.cfg.au,
-            self.cfg.chain,
             r.as_ref().map(|_| ()),
             self.pipe.status,
             self.pipe.au().map(|a| a.name.clone())
         ));
-        if let Some(a) = self.pipe.au() {
-            log(&format!(
-                "AU factory presets: {:?}",
-                a.handle().factory_presets()
-            ));
-        }
+
         self.save();
-        unsafe { self.update_icon() };
+        unsafe {
+            self.update_icon();
+            self.refresh_header();
+        }
     }
 
     unsafe fn update_icon(&self) {
@@ -488,15 +717,84 @@ impl Ui {
         self.plugin_window = win;
     }
 
-    unsafe fn populate(&mut self, menu: Id) {
-        send!(menu, "removeAllItems"; -> ());
+    // ---------------------------------------------------------------- popover
+
+    unsafe fn popover_shown(&self) -> bool {
+        send!(self.popover, "isShown"; -> ObjcBool) == YES
+    }
+
+    unsafe fn toggle_popover(&mut self) {
+        if self.popover_shown() {
+            send!(self.popover, "performClose:", ptr::null_mut::<c_void>() => Id; -> ());
+            return;
+        }
+
+        // The click on the icon that closed the popover arrives here right after.
+        if self
+            .closed_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(300))
+        {
+            return;
+        }
+
+        self.rebuild();
+        let button = send!(self.status_item, "button"; -> Id);
+        #[cfg(target_arch = "aarch64")]
+        let bounds: NSRect = send!(button, "bounds"; -> NSRect);
+        #[cfg(not(target_arch = "aarch64"))]
+        let bounds = NSRect::new(0.0, 0.0, 24.0, 22.0);
+        activate_app();
+        send!(self.popover, "showRelativeToRect:ofView:preferredEdge:",
+            bounds => NSRect, button => Id, 1usize => usize; -> ()); // below the icon
+    }
+
+    /// Rebuild later, outside the action of a control the rebuild would free.
+    unsafe fn schedule_rebuild(&self) {
+        send!(self.controller, "performSelector:withObject:afterDelay:",
+            sel(c"rebuild:") => Sel, ptr::null_mut::<c_void>() => Id, 0.0f64 => f64; -> ());
+    }
+
+    /// Returns the content height.
+    unsafe fn rebuild(&mut self) -> f64 {
+        let doc = send!(self.flipped, "alloc"; -> Id);
+        let doc = send!(doc, "initWithFrame:", NSRect::new(0.0, 0.0, W, 100.0) => NSRect; -> Id);
+        self.c = Controls::default();
+        let mut r = Rows { view: doc, y: 12.0 };
+        self.build_header(&mut r);
+        match self.cfg.mode {
+            Mode::Builtin => self.build_builtin(&mut r),
+            Mode::Plugin => self.build_plugin(&mut r),
+        }
+        r.rule();
+        let quit = button("Выйти", self.controller, c"quit:");
+        r.put(quit, W - PAD - 80.0, 0.0, 80.0, 24.0);
+        r.y += 32.0;
+
+        let h = r.y;
+        send!(doc, "setFrameSize:", NSSize { width: W, height: h } => NSSize; -> ());
+        send!(self.scroll, "setDocumentView:", doc => Id; -> ());
+        send!(doc, "release"; -> ());
+        send!(self.popover, "setContentSize:", NSSize { width: W, height: h.min(MAX_H) } => NSSize; -> ());
+        let clip = send!(self.scroll, "contentView"; -> Id);
+        send!(clip, "scrollToPoint:", NSPoint { x: 0.0, y: 0.0 } => NSPoint; -> ());
+        send!(self.scroll, "reflectScrolledClipView:", clip => Id; -> ());
+        h
+    }
+
+    unsafe fn build_header(&mut self, r: &mut Rows) {
         let c = self.controller;
 
-        let st = add(menu, menu_item(&self.pipe.status, None, c, 0));
-        set_enabled(st, false);
-        let en = add(menu, menu_item("Enabled", Some(c"toggleEnabled:"), c, 0));
-        set_state(en, self.cfg.enabled);
-        separator(menu);
+        r.put(text("Vinylizer", 13.0, true, false), PAD, 0.0, 200.0, 18.0);
+        let sw = on_off_switch(self.cfg.enabled, c, c"toggleEnabled:");
+        set_tooltip(sw, "Включить или выключить обработку звука");
+        r.put(sw, W - PAD - 38.0, -1.0, 38.0, 20.0);
+        self.c.enabled = sw;
+        r.y += 21.0;
+        let st = text(&self.pipe.status, 11.0, false, true);
+        r.put(st, PAD, 0.0, W - 2.0 * PAD, 15.0);
+        self.c.status = st;
+        r.y += 18.0;
+        r.rule();
 
         // ---- which apps
         self.apps = list_apps(&self.cfg.targets);
@@ -507,144 +805,179 @@ impl Ui {
             .map(|a| a.name.as_str())
             .collect();
         let title = if self.cfg.targets.is_empty() {
-            "Apply to: All Apps".to_string()
+            "Все приложения".to_string()
         } else {
-            format!("Apply to: {}", chosen.join(", "))
+            chosen.join(", ")
         };
-        let apply = add(menu, menu_item(&title, None, c, 0));
-        let sub = new_menu("Apply to");
-        set_state(
-            add(sub, menu_item("All Apps", Some(c"selectTarget:"), c, -1)),
-            self.cfg.targets.is_empty(),
-        );
-        separator(sub);
+        let p = popup(c, c"selectTarget:", true);
+        popup_add(p, &title, -2);
+        set_state(popup_add(p, "Все приложения", -1), self.cfg.targets.is_empty());
+        popup_separator(p);
         if self.apps.is_empty() {
-            set_enabled(
-                add(sub, menu_item("No apps using audio", None, c, 0)),
-                false,
-            );
+            set_enabled(popup_add(p, "Никто не играет звук", -3), false);
         }
         for (i, a) in self.apps.iter().enumerate() {
             let t = match (a.playing, a.running) {
                 (true, _) => format!("{}   ♪", a.name),
-                (false, false) => format!("{}   (not running)", a.name),
+                (false, false) => format!("{}   (не запущено)", a.name),
                 _ => a.name.clone(),
             };
-            set_state(
-                add(sub, menu_item(&t, Some(c"selectTarget:"), c, i as isize)),
-                self.cfg.targets.contains(&a.root),
-            );
+            set_state(popup_add(p, &t, i as isize), self.cfg.targets.contains(&a.root));
         }
-        send!(apply, "setSubmenu:", sub => Id; -> ());
+        r.field("Применять к", p, W - FIELD_X - PAD);
 
-        // ---- effect
-        let cur = self
-            .cfg
-            .au
-            .clone()
-            .unwrap_or_else(|| "Built-in Vinyl".into());
-        let eff = add(menu, menu_item(&format!("Effect: {cur}"), None, c, 0));
-        let sub = new_menu("Effect");
-        for (i, n) in self.effects.iter().enumerate() {
-            set_state(
-                add(sub, menu_item(n, Some(c"selectEffect:"), c, i as isize)),
-                self.cfg.au.as_deref() == Some(n),
-            );
-        }
-        separator(sub);
-        set_state(
-            add(
-                sub,
-                menu_item("Built-in Vinyl", Some(c"selectEffect:"), c, -1),
-            ),
-            self.cfg.au.is_none(),
-        );
-        send!(eff, "setSubmenu:", sub => Id; -> ());
-        separator(menu);
-
-        if self.cfg.au.is_some() {
-            self.populate_au(menu);
-        } else {
-            self.populate_builtin(menu);
-        }
-        separator(menu);
-        add(menu, menu_item("Quit Vinylizer", Some(c"quit:"), c, 0));
+        // ---- mode
+        let mode = match self.cfg.mode {
+            Mode::Builtin => 0,
+            Mode::Plugin => 1,
+        };
+        let seg = segmented(&["Vinylizer", "Сторонний плагин"], mode, c, c"selectMode:");
+        r.field("Режим", seg, W - FIELD_X - PAD);
+        r.rule();
     }
 
-    unsafe fn populate_au(&mut self, menu: Id) {
+    unsafe fn build_builtin(&mut self, r: &mut Rows) {
         let c = self.controller;
-        let Some(plugin) = self.pipe.au() else {
-            set_enabled(
-                add(
-                    menu,
-                    menu_item("Plugin not loaded (enable Vinylizer)", None, c, 0),
-                ),
-                false,
+        let params = self.pipe.params.clone();
+
+        let p = popup(c, c"selectPreset:", false);
+        for (i, (_, label, _)) in PRESETS.iter().enumerate() {
+            popup_add(p, label, i as isize);
+        }
+        self.builtin_user = builtin_user_presets(&user_preset_dir());
+        if !self.builtin_user.is_empty() {
+            popup_separator(p);
+        }
+        for (i, (name, _)) in self.builtin_user.iter().enumerate() {
+            popup_add(p, name, USER_BASE + i as isize);
+        }
+        popup_separator(p);
+        popup_add(p, "Свой (не сохранён)", -1);
+        self.c.preset = p;
+        let bp = checkbox("Без эффекта", params.bypass.load(Relaxed), c, c"toggleBypass:");
+        set_tooltip(bp, "Сравнить с оригиналом: звук идёт мимо эффекта, пока галочка стоит");
+        r.put(bp, W - PAD - 96.0, 3.0, 96.0, 18.0);
+        self.c.bypass = bp;
+        r.field("Пресет", p, W - FIELD_X - PAD - 104.0);
+
+        let save = button("Сохранить", c, c"saveBuiltinPreset:");
+        set_tooltip(save, "Перезаписать свой пресет текущими настройками");
+        let save_as = button("Сохранить как…", c, c"saveBuiltinPresetAs:");
+        set_tooltip(save_as, "Сохранить текущие настройки под новым именем");
+        let del = button("Удалить…", c, c"deleteBuiltinPreset:");
+        let reset = button("Сбросить", c, c"resetBuiltin:");
+        set_tooltip(reset, "Вернуть настройки по умолчанию (пресет «Тёплая»)");
+        r.buttons(PAD, &[(save, 84.0), (save_as, 110.0), (del, 76.0), (reset, 74.0)]);
+        self.c.preset_save = save;
+        self.c.preset_delete = del;
+
+        let rp = popup(c, c"selectRpm:", false);
+        for (i, l) in RPM_LABELS.iter().enumerate() {
+            popup_add(rp, l, i as isize);
+        }
+        set_tooltip(rp, PARAM_INFO[PARAM_NAMES.len() - 1].2);
+        self.c.rpm = rp;
+        r.field("Скорость", rp, 140.0);
+        r.y += 4.0;
+
+        self.c.sliders = vec![(ptr::null_mut(), ptr::null_mut()); PARAM_NAMES.len()];
+        for (i, (key, name, hint)) in PARAM_INFO.iter().enumerate() {
+            if *key == "rpm" {
+                continue;
+            }
+            let v = params.get(key).unwrap_or(0.0);
+            let max = if *key == "gain" { 2.0 } else { 1.0 };
+            self.c.sliders[i] = self.slider_row(
+                r,
+                i,
+                name,
+                Some(hint),
+                v as f64,
+                0.0,
+                max,
+                &format_builtin(key, v),
+                c"sliderChanged:",
             );
+        }
+
+        // Values that equal a user preset mean that preset is loaded, so later edits can be saved over it.
+        if self.current_user_preset().is_none() && self.pipe.params.matching_preset().is_none() {
+            if let Some(i) = self.matching_user_preset() {
+                self.cfg.preset = Some(self.builtin_user[i].0.clone());
+                self.dirty = true;
+            }
+        }
+        self.refresh_builtin();
+    }
+
+    unsafe fn build_plugin(&mut self, r: &mut Rows) {
+        let c = self.controller;
+
+        let p = popup(c, c"selectEffect:", false);
+        if self.cfg.au.is_none() {
+            popup_add(p, "Выберите плагин", -1);
+        }
+        for (i, n) in self.effects.iter().enumerate() {
+            popup_add(p, n, i as isize);
+        }
+        if self.effects.is_empty() {
+            set_enabled(popup_add(p, "Нет установленных AU-эффектов", -2), false);
+        }
+        let sel_tag = self
+            .cfg
+            .au
+            .as_ref()
+            .and_then(|a| self.effects.iter().position(|e| e == a))
+            .map_or(-1, |i| i as isize);
+        popup_select_tag(p, sel_tag);
+        let win = button("Окно плагина…", c, c"openPluginUI:");
+        set_enabled(win, self.pipe.au().is_some());
+        r.put(win, W - PAD - 110.0, 0.0, 110.0, 24.0);
+        r.field("Плагин", p, W - FIELD_X - PAD - 116.0);
+
+        let Some(plugin) = self.pipe.au() else {
+            let why = if self.cfg.au.is_none() {
+                "Выберите плагин из списка выше"
+            } else if !self.cfg.enabled {
+                "Плагин загрузится, когда Vinylizer включён"
+            } else {
+                "Плагин не загружен — см. статус вверху"
+            };
+            r.put(text(why, 11.0, false, true), PAD, 0.0, W - 2.0 * PAD, 15.0);
+            r.y += 20.0;
             return;
         };
         let h = plugin.handle();
         let plugin_name = plugin.name.clone();
 
-        // ---- presets
+        // ---- presets: the plugin's own (factory) and the ones hosts saved for it
         self.au_user_presets = user_presets(&plugin_name);
         self.au_presets = h.factory_presets();
         let only_default = self.au_presets.len() == 1;
         self.au_presets.retain(|p| p.1 != "Default" || only_default);
-        let cur = self.cfg.au_preset.clone();
-        let cur_label = match (&cur, self.au_modified) {
-            (Some(n), true) => format!("Preset: {n} (edited)"),
-            (Some(n), false) => format!("Preset: {n}"),
-            (None, _) => "Preset: —".into(),
-        };
-        let pp = add(menu, menu_item(&cur_label, None, c, 0));
-        let sub = new_menu("Preset");
+        let pp = popup(c, c"selectAuPreset:", false);
+        popup_add(pp, "—", NO_PRESET);
         for (i, (name, _)) in self.au_user_presets.iter().enumerate() {
-            set_state(
-                add(
-                    sub,
-                    menu_item(name, Some(c"selectAuUserPreset:"), c, i as isize),
-                ),
-                cur.as_deref() == Some(name),
-            );
+            popup_add(pp, name, i as isize);
         }
-        if !self.au_user_presets.is_empty() && !self.au_presets.is_empty() {
-            separator(sub);
+        if !self.au_presets.is_empty() {
+            popup_separator(pp);
         }
         for (num, name) in &self.au_presets {
-            set_state(
-                add(
-                    sub,
-                    menu_item(name, Some(c"selectAuPreset:"), c, *num as isize),
-                ),
-                cur.as_deref() == Some(name),
-            );
+            popup_add(pp, name, FACTORY_BASE + *num as isize);
         }
-        send!(pp, "setSubmenu:", sub => Id; -> ());
+        self.c.au_preset = pp;
+        r.field("Пресет", pp, W - FIELD_X - PAD);
 
-        let is_user = cur
-            .as_ref()
-            .is_some_and(|n| self.au_user_presets.iter().any(|p| &p.0 == n));
-        let save_title = match (&cur, is_user) {
-            (Some(n), true) => format!("Save Preset \u{201c}{n}\u{201d}"),
-            _ => "Save Preset".into(),
-        };
-        let save = add(menu, menu_item(&save_title, Some(c"savePreset:"), c, 0));
-        set_enabled(save, is_user && self.au_modified);
-        add(
-            menu,
-            menu_item("Save Preset As…", Some(c"savePresetAs:"), c, 0),
-        );
-        let del = add(
-            menu,
-            menu_item("Delete Preset…", Some(c"deletePreset:"), c, 0),
-        );
-        set_enabled(del, is_user);
-        add(
-            menu,
-            menu_item("Open Plugin Window…", Some(c"openPluginUI:"), c, 0),
-        );
-        separator(menu);
+        let save = button("Сохранить", c, c"savePreset:");
+        let save_as = button("Сохранить как…", c, c"savePresetAs:");
+        let del = button("Удалить…", c, c"deletePreset:");
+        let reset = button("Сбросить", c, c"resetPlugin:");
+        set_tooltip(reset, "Вернуть плагину настройки по умолчанию");
+        r.buttons(PAD, &[(save, 84.0), (save_as, 110.0), (del, 76.0), (reset, 74.0)]);
+        self.c.au_save = save;
+        self.c.au_delete = del;
+        r.rule();
 
         // ---- live parameters
         self.au_params = h
@@ -652,26 +985,29 @@ impl Ui {
             .into_iter()
             .filter(|p| p.flags & kAudioUnitParameterFlag_IsWritable != 0 && p.max > p.min)
             .collect();
-        self.au_value_labels = vec![ptr::null_mut(); self.au_params.len()];
-        let hdr = add(menu, menu_item(&plugin_name, None, c, 0));
-        set_enabled(hdr, false);
+        if self.au_params.is_empty() {
+            r.put(text("Нет изменяемых параметров", 11.0, false, true), PAD, 0.0, 300.0, 15.0);
+            r.y += 20.0;
+        }
         for i in 0..self.au_params.len() {
             let p = self.au_params[i].clone();
             let v = h.get_param(p.id);
-            match p.unit {
+            let row = match p.unit {
                 kAudioUnitParameterUnit_Boolean => {
-                    let it = add(menu, menu_item(&p.name, Some(c"auToggle:"), c, i as isize));
-                    set_state(it, v >= 0.5);
+                    let b = checkbox(&p.name, v >= 0.5, c, c"auToggle:");
+                    send!(b, "setTag:", i as isize => isize; -> ());
+                    r.put(b, PAD, 0.0, W - 2.0 * PAD, 18.0);
+                    r.y += 24.0;
+                    AuRow {
+                        kind: AuKind::Toggle,
+                        control: b,
+                        value: ptr::null_mut(),
+                    }
                 }
                 kAudioUnitParameterUnit_Indexed => {
                     let names = h.value_strings(p.id);
-                    let idx = v.round() as i64;
-                    let shown = names
-                        .get((idx - p.min as i64).max(0) as usize)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{idx}"));
-                    let it = add(menu, menu_item(&format!("{}: {shown}", p.name), None, c, 0));
-                    let sub = new_menu(&p.name);
+                    let pop = popup(c, c"auIndex:", false);
+                    send!(pop, "setTag:", i as isize => isize; -> ());
                     let lo = p.min.round() as i64;
                     let hi = p.max.round() as i64;
                     for k in lo..=hi {
@@ -679,103 +1015,234 @@ impl Ui {
                             .get((k - lo) as usize)
                             .cloned()
                             .unwrap_or_else(|| format!("{k}"));
-                        let tag = ((i as isize) << 16) | ((k - lo) as isize);
-                        set_state(
-                            add(sub, menu_item(&label, Some(c"auIndex:"), c, tag)),
-                            k == idx,
-                        );
+                        popup_add(pop, &label, (k - lo) as isize);
                     }
-                    send!(it, "setSubmenu:", sub => Id; -> ());
+                    r.put(text(&p.name, 12.0, false, false), PAD, 4.0, SLIDER_X - PAD, 17.0);
+                    r.put(pop, SLIDER_X, 0.0, W - SLIDER_X - PAD, 24.0);
+                    r.y += 28.0;
+                    AuRow {
+                        kind: AuKind::Index,
+                        control: pop,
+                        value: ptr::null_mut(),
+                    }
                 }
                 _ => {
-                    let lbl = self.param_slider(
-                        menu,
+                    let (slider, value) = self.slider_row(
+                        r,
                         i,
                         &p.name,
+                        None,
                         v as f64,
                         p.min as f64,
                         p.max as f64,
                         &p.format(v),
                         c"auSliderChanged:",
                     );
-                    self.au_value_labels[i] = lbl;
+                    AuRow {
+                        kind: AuKind::Slider,
+                        control: slider,
+                        value,
+                    }
                 }
-            }
+            };
+            self.c.au_rows.push(row);
         }
-        if self.au_params.is_empty() {
-            set_enabled(
-                add(menu, menu_item("No editable parameters", None, c, 0)),
-                false,
-            );
-        }
+        self.refresh_au();
     }
 
-    unsafe fn populate_builtin(&mut self, menu: Id) {
-        let c = self.controller;
-        let pr = add(menu, menu_item("Preset", None, c, 0));
-        let sub = new_menu("Preset");
-        for (i, (n, _)) in PRESETS.iter().enumerate() {
-            add(sub, menu_item(n, Some(c"selectPreset:"), c, i as isize));
-        }
-        send!(pr, "setSubmenu:", sub => Id; -> ());
-        let bp = add(menu, menu_item("Bypass", Some(c"toggleBypass:"), c, 0));
-        set_state(bp, self.pipe.params.bypass.load(Relaxed));
-        self.value_labels = vec![ptr::null_mut(); PARAM_NAMES.len()];
-        for (i, n) in PARAM_NAMES.iter().enumerate() {
-            let v = self.pipe.params.get(n).unwrap_or(0.0) as f64;
-            let max = if *n == "gain" { 2.0 } else { 1.0 };
-            self.value_labels[i] = self.param_slider(
-                menu,
-                i,
-                n,
-                v,
-                0.0,
-                max,
-                &format!("{v:.2}"),
-                c"sliderChanged:",
-            );
-        }
-    }
-
-    /// Menu row: name | slider | value. Returns the value label.
+    /// Row: name | slider | value, with an optional hint line underneath.
+    /// Returns (slider, value label).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn param_slider(
+    unsafe fn slider_row(
         &mut self,
-        menu: Id,
+        r: &mut Rows,
         tag: usize,
         name: &str,
+        hint: Option<&str>,
         value: f64,
         min: f64,
         max: f64,
-        text: &str,
+        shown: &str,
         action: &CStr,
-    ) -> Id {
-        let view = send!(send!(class(c"NSView"), "alloc"; -> Id), "initWithFrame:", NSRect::new(0.0, 0.0, 380.0, 26.0) => NSRect; -> Id);
-        let name_l = label(name, NSRect::new(20.0, 4.0, 140.0, 17.0), 12.0);
-        let val_l = label(text, NSRect::new(316.0, 4.0, 62.0, 17.0), 11.0);
+    ) -> (Id, Id) {
+        let name_l = text(name, 12.0, false, false);
+        r.put(name_l, PAD, 2.0, SLIDER_X - PAD - 4.0, 17.0);
         let slider = send!(class(c"NSSlider"), "sliderWithValue:minValue:maxValue:target:action:",
             value => f64, min => f64, max => f64, self.controller => Id, sel(action) => Sel; -> Id);
-        send!(slider, "setFrame:", NSRect::new(160.0, 3.0, 152.0, 20.0) => NSRect; -> ());
         send!(slider, "setTag:", tag as isize => isize; -> ());
         send!(slider, "setContinuous:", YES => ObjcBool; -> ());
         send!(slider, "setControlSize:", 1isize => isize; -> ());
-        send!(view, "addSubview:", name_l => Id; -> ());
-        send!(view, "addSubview:", slider => Id; -> ());
-        send!(view, "addSubview:", val_l => Id; -> ());
-        let item = menu_item(name, None, self.controller, 0);
-        send!(item, "setView:", view => Id; -> ());
-        send!(view, "release"; -> ());
-        add(menu, item);
-        val_l
+        r.put(slider, SLIDER_X, 0.0, W - SLIDER_X - PAD - VALUE_W - 4.0, 20.0);
+        let val_l = text(shown, 11.0, false, false);
+        send!(val_l, "setAlignment:", ALIGN_RIGHT => isize; -> ());
+        r.put(val_l, W - PAD - VALUE_W, 3.0, VALUE_W, 15.0);
+
+        match hint {
+            Some(h) => {
+                set_tooltip(name_l, h);
+                set_tooltip(slider, h);
+                r.put(text(h, 10.5, false, true), PAD, 19.0, W - 2.0 * PAD, 14.0);
+                r.y += 40.0;
+            }
+            None => r.y += 26.0,
+        }
+        (slider, val_l)
+    }
+
+    unsafe fn refresh_header(&self) {
+        if !self.c.status.is_null() {
+            set_text(self.c.status, &self.pipe.status);
+        }
+        if !self.c.enabled.is_null() {
+            send!(self.c.enabled, "setState:", self.cfg.enabled as isize => isize; -> ());
+        }
+    }
+
+    /// Push the current built-in values into the controls (after a preset change).
+    unsafe fn refresh_builtin(&self) {
+        if self.c.preset.is_null() {
+            return;
+        }
+
+        let params = &self.pipe.params;
+        for (i, n) in PARAM_NAMES.iter().enumerate() {
+            let (slider, label) = self.c.sliders[i];
+            if slider.is_null() {
+                continue;
+            }
+            let v = params.get(n).unwrap_or(0.0);
+            send!(slider, "setDoubleValue:", v as f64 => f64; -> ());
+            set_text(label, &format_builtin(n, v));
+        }
+        popup_select_tag(self.c.rpm, params.rpm_index() as isize);
+        send!(self.c.bypass, "setState:", params.bypass.load(Relaxed) as isize => isize; -> ());
+        self.refresh_preset_choice();
+    }
+
+    /// The user preset the current values match, if any.
+    fn matching_user_preset(&self) -> Option<usize> {
+        self.builtin_user
+            .iter()
+            .position(|(_, vals)| self.pipe.params.matches(vals))
+    }
+
+    /// The user preset last loaded or saved, if it still exists.
+    fn current_user_preset(&self) -> Option<usize> {
+        let name = self.cfg.preset.as_deref()?;
+        self.builtin_user.iter().position(|(n, _)| n == name)
+    }
+
+    /// The user preset that Save overwrites and Delete removes.
+    fn selected_user_preset(&self) -> Option<usize> {
+        self.current_user_preset()
+            .or_else(|| self.matching_user_preset())
+    }
+
+    unsafe fn refresh_preset_choice(&self) {
+        if self.c.preset.is_null() {
+            return;
+        }
+
+        // The loaded user preset stays selected while edited; otherwise a shipped preset
+        // wins over a user one holding the same values.
+        let current = self.current_user_preset();
+        let edited = current.is_some_and(|i| !self.pipe.params.matches(&self.builtin_user[i].1));
+        let tag = match (current, self.pipe.params.matching_preset(), self.matching_user_preset()) {
+            (Some(i), _, _) => USER_BASE + i as isize,
+            (None, Some(i), _) => i as isize,
+            (None, None, Some(i)) => USER_BASE + i as isize,
+            (None, None, None) => -1,
+        };
+
+        let menu = send!(self.c.preset, "menu"; -> Id);
+        for (i, (name, _)) in self.builtin_user.iter().enumerate() {
+            let it = send!(menu, "itemWithTag:", USER_BASE + i as isize => isize; -> Id);
+            let t = ns(&if edited && current == Some(i) {
+                format!("{name} (изменён)")
+            } else {
+                name.clone()
+            });
+            send!(it, "setTitle:", t.0 as Id => Id; -> ());
+        }
+        popup_select_tag(self.c.preset, tag);
+
+        set_enabled(self.c.preset_save, edited);
+        set_enabled(self.c.preset_delete, self.selected_user_preset().is_some());
+    }
+
+    /// Push the plugin's current values into the controls (after a preset load).
+    unsafe fn refresh_au(&self) {
+        let Some(plugin) = self.pipe.au() else { return };
+        let h = plugin.handle();
+
+        for (row, p) in self.c.au_rows.iter().zip(&self.au_params) {
+            let v = h.get_param(p.id);
+            match row.kind {
+                AuKind::Slider => {
+                    send!(row.control, "setDoubleValue:", v as f64 => f64; -> ());
+                    set_text(row.value, &p.format(v));
+                }
+                AuKind::Toggle => {
+                    send!(row.control, "setState:", (v >= 0.5) as isize => isize; -> ());
+                }
+                AuKind::Index => {
+                    popup_select_tag(row.control, (v.round() - p.min.round()) as isize);
+                }
+            }
+        }
+        self.refresh_au_preset();
+    }
+
+    /// Preset pop-up selection, "edited" mark, Save/Delete availability.
+    unsafe fn refresh_au_preset(&self) {
+        let pp = self.c.au_preset;
+        if pp.is_null() {
+            return;
+        }
+
+        let cur = self.cfg.au_preset.as_deref();
+        let user_idx = cur.and_then(|n| self.au_user_presets.iter().position(|p| p.0 == n));
+        let factory = cur.and_then(|n| self.au_presets.iter().find(|p| p.1 == n));
+        let tag = match (user_idx, factory) {
+            (Some(i), _) => i as isize,
+            (None, Some((num, _))) => FACTORY_BASE + *num as isize,
+            _ => NO_PRESET,
+        };
+
+        // Item titles carry the "edited" mark of the selected one only.
+        let menu = send!(pp, "menu"; -> Id);
+        for (i, (name, _)) in self.au_user_presets.iter().enumerate() {
+            let it = send!(menu, "itemWithTag:", i as isize => isize; -> Id);
+            let t = ns(&if self.au_modified && i as isize == tag {
+                format!("{name} (изменён)")
+            } else {
+                name.clone()
+            });
+            send!(it, "setTitle:", t.0 as Id => Id; -> ());
+        }
+        for (num, name) in &self.au_presets {
+            let ftag = FACTORY_BASE + *num as isize;
+            let it = send!(menu, "itemWithTag:", ftag => isize; -> Id);
+            let t = ns(&if self.au_modified && ftag == tag {
+                format!("{name} (изменён)")
+            } else {
+                name.clone()
+            });
+            send!(it, "setTitle:", t.0 as Id => Id; -> ());
+        }
+        popup_select_tag(pp, tag);
+
+        set_enabled(self.c.au_save, user_idx.is_some() && self.au_modified);
+        set_enabled(self.c.au_delete, user_idx.is_some());
     }
 
     /// Write the plugin's current state as `<name>.aupreset` in the user preset folder.
     fn write_preset(&mut self, name: &str) -> Result<(), String> {
-        let a = self.pipe.au().ok_or("no plugin loaded")?;
+        let a = self.pipe.au().ok_or("плагин не загружен")?;
         let bytes = a
             .handle()
             .export_preset(name)
-            .ok_or("plugin did not return its state")?;
+            .ok_or("плагин не отдал своё состояние")?;
         let dir = preset_dir(&a.name);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(dir.join(format!("{name}.aupreset")), bytes).map_err(|e| e.to_string())?;
@@ -800,17 +1267,42 @@ unsafe fn tag_of(sender: Id) -> isize {
     send!(sender, "tag"; -> isize)
 }
 
-extern "C" fn on_toggle_enabled(_: Id, _: Sel, _: Id) {
+extern "C" fn is_flipped(_: Id, _: Sel) -> ObjcBool {
+    YES
+}
+
+extern "C" fn on_toggle_popover(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe { ui.toggle_popover() });
+}
+
+extern "C" fn on_popover_closed(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| ui.closed_at = Some(Instant::now()));
+}
+
+extern "C" fn on_rebuild(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        ui.rebuild();
+    });
+}
+
+extern "C" fn on_toggle_enabled(_: Id, _: Sel, sender: Id) {
+    let on = unsafe { send!(sender, "state"; -> isize) } != 0;
     with_ui(|ui| {
-        ui.cfg.enabled = !ui.cfg.enabled;
+        let had_au = ui.pipe.au().is_some();
+        ui.cfg.enabled = on;
         ui.apply();
+        if ui.pipe.au().is_some() != had_au {
+            unsafe { ui.schedule_rebuild() };
+        }
     });
 }
 
 extern "C" fn on_select_target(_: Id, _: Sel, sender: Id) {
-    let tag = unsafe { tag_of(sender) };
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
     with_ui(|ui| {
-        if tag < 0 {
+        if tag == -1 {
             ui.cfg.targets.clear();
         } else if let Some(a) = ui.apps.get(tag as usize) {
             if let Some(pos) = ui.cfg.targets.iter().position(|t| t == &a.root) {
@@ -818,44 +1310,205 @@ extern "C" fn on_select_target(_: Id, _: Sel, sender: Id) {
             } else {
                 ui.cfg.targets.push(a.root.clone());
             }
+        } else {
+            return;
         }
         ui.apply();
+        unsafe { ui.schedule_rebuild() };
+    });
+}
+
+extern "C" fn on_select_mode(_: Id, _: Sel, sender: Id) {
+    let seg = unsafe { send!(sender, "selectedSegment"; -> isize) };
+    with_ui(|ui| {
+        ui.cfg.mode = if seg == 1 { Mode::Plugin } else { Mode::Builtin };
+        ui.cfg.chain = false;
+        // First time in plugin mode: take the first vinyl-like effect.
+        if ui.cfg.mode == Mode::Plugin && ui.cfg.au.is_none() {
+            ui.cfg.au = ui.effects.first().cloned();
+        }
+        ui.apply();
+        unsafe { ui.schedule_rebuild() };
     });
 }
 
 extern "C" fn on_select_effect(_: Id, _: Sel, sender: Id) {
-    let tag = unsafe { tag_of(sender) };
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
     with_ui(|ui| {
-        ui.cfg.au = if tag < 0 {
-            None
-        } else {
-            ui.effects.get(tag as usize).cloned()
+        let Some(name) = ui.effects.get(tag as usize).cloned() else {
+            return;
         };
+        if ui.cfg.au.as_deref() != Some(&name) {
+            ui.cfg.au = Some(name);
+            ui.cfg.au_preset = None;
+            ui.au_modified = false;
+        }
         ui.apply();
+        unsafe { ui.schedule_rebuild() };
     });
 }
 
-extern "C" fn on_toggle_chain(_: Id, _: Sel, _: Id) {
-    with_ui(|ui| {
-        ui.cfg.chain = !ui.cfg.chain;
-        ui.apply();
-    });
-}
-
-extern "C" fn on_toggle_bypass(_: Id, _: Sel, _: Id) {
-    with_ui(|ui| {
-        let b = !ui.pipe.params.bypass.load(Relaxed);
-        ui.pipe.params.bypass.store(b, Relaxed);
-    });
+extern "C" fn on_toggle_bypass(_: Id, _: Sel, sender: Id) {
+    let on = unsafe { send!(sender, "state"; -> isize) } != 0;
+    with_ui(|ui| ui.pipe.params.bypass.store(on, Relaxed));
 }
 
 extern "C" fn on_select_preset(_: Id, _: Sel, sender: Id) {
-    let tag = unsafe { tag_of(sender) };
-    with_ui(|ui| {
-        if let Some((n, _)) = PRESETS.get(tag as usize) {
-            let _ = ui.pipe.params.apply_preset(n);
-            ui.save();
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
+    with_ui(|ui| unsafe {
+        if tag >= USER_BASE {
+            if let Some((name, vals)) = ui.builtin_user.get((tag - USER_BASE) as usize).cloned() {
+                ui.pipe.params.apply_values(&vals);
+                ui.cfg.preset = Some(name);
+                ui.save();
+            }
+        } else if tag >= 0 {
+            if let Some((n, _, _)) = PRESETS.get(tag as usize) {
+                let _ = ui.pipe.params.apply_preset(n);
+                ui.cfg.preset = None;
+                ui.save();
+            }
         }
+        ui.refresh_builtin();
+    });
+}
+
+/// Overwrite the current user preset with the current values.
+extern "C" fn on_save_builtin_preset(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let Some(i) = ui.current_user_preset() else {
+            return;
+        };
+        let name = ui.builtin_user[i].0.clone();
+
+        let r = save_user_preset(&user_preset_dir(), &name, &ui.pipe.params);
+        log(&format!("overwrite built-in preset {name}: {r:?}"));
+        match r {
+            Ok(()) => {
+                ui.builtin_user[i].1 = ui.pipe.params.values();
+                ui.refresh_preset_choice();
+            }
+            Err(e) => notify_error("Не удалось сохранить пресет", &e.to_string()),
+        }
+    });
+}
+
+extern "C" fn on_save_builtin_preset_as(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let dir = user_preset_dir();
+        let default = ui
+            .selected_user_preset()
+            .map(|i| ui.builtin_user[i].0.clone())
+            .unwrap_or_else(|| "Мой пресет".into());
+        let Some(name) = prompt(
+            "Сохранить пресет Vinylizer",
+            &format!("Текущие настройки сохранятся в {}.", dir.display()),
+            &default,
+            "Сохранить",
+        ) else {
+            return;
+        };
+
+        if user_preset_path(&dir, &name).exists()
+            && !confirm(
+                &format!("Заменить \u{201c}{name}\u{201d}?"),
+                "Пресет с таким именем уже есть.",
+                "Заменить",
+            )
+        {
+            return;
+        }
+
+        let r = save_user_preset(&dir, &name, &ui.pipe.params);
+        log(&format!("save built-in preset {name}: {r:?}"));
+        match r {
+            Ok(()) => {
+                ui.cfg.preset = Some(name);
+                ui.save();
+                ui.schedule_rebuild();
+            }
+            Err(e) => notify_error("Не удалось сохранить пресет", &e.to_string()),
+        }
+    });
+}
+
+extern "C" fn on_delete_builtin_preset(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let Some(i) = ui.selected_user_preset() else {
+            return;
+        };
+        let name = ui.builtin_user[i].0.clone();
+        let path = user_preset_path(&user_preset_dir(), &name);
+        if !confirm(
+            &format!("Удалить пресет \u{201c}{name}\u{201d}?"),
+            "Файл будет перемещён в Корзину. Текущие настройки останутся как есть.",
+            "В Корзину",
+        ) {
+            return;
+        }
+
+        let ok = trash(&path);
+        log(&format!("delete built-in preset {name}: {ok}"));
+        if ok {
+            ui.cfg.preset = None;
+            ui.save();
+            ui.schedule_rebuild();
+        } else {
+            notify_error("Не удалось удалить пресет", &path.display().to_string());
+        }
+    });
+}
+
+extern "C" fn on_reset_builtin(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let _ = ui.pipe.params.apply_preset(DEFAULT_PRESET);
+        ui.pipe.params.bypass.store(false, Relaxed);
+        ui.cfg.preset = None;
+        ui.save();
+        ui.refresh_builtin();
+    });
+}
+
+extern "C" fn on_reset_plugin(_: Id, _: Sel, _: Id) {
+    with_ui(|ui| unsafe {
+        let Some(a) = ui.pipe.au() else { return };
+        let h = a.handle();
+
+        // The plugin's own "Default" preset knows about state the parameters don't show.
+        let factory_default = h.factory_presets().into_iter().find(|p| p.1 == "Default");
+        let r = match &factory_default {
+            Some((num, _)) => h.set_preset(*num),
+            None => {
+                for p in h.params() {
+                    if p.flags & kAudioUnitParameterFlag_IsWritable != 0 {
+                        let _ = h.set_param(p.id, p.default);
+                    }
+                }
+                Ok(())
+            }
+        };
+        log(&format!("reset plugin to defaults: {r:?}"));
+
+        ui.cfg.au_preset = factory_default.map(|p| p.1);
+        ui.au_modified = false;
+        ui.save();
+        ui.pipe.save_au_state();
+        ui.refresh_au();
+    });
+}
+
+extern "C" fn on_select_rpm(_: Id, _: Sel, sender: Id) {
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
+    with_ui(|ui| unsafe {
+        let _ = ui.pipe.params.set("rpm", tag as f32);
+        ui.dirty = true;
+        ui.refresh_preset_choice();
     });
 }
 
@@ -864,58 +1517,58 @@ extern "C" fn on_slider(_: Id, _: Sel, sender: Id) {
         let idx = tag_of(sender) as usize;
         let v = send!(sender, "doubleValue"; -> f64) as f32;
         with_ui(|ui| {
-            if let Some(n) = PARAM_NAMES.get(idx) {
-                let _ = ui.pipe.params.set(n, v);
-                if let Some(&l) = ui.value_labels.get(idx) {
-                    if !l.is_null() {
-                        let t = ns(&format!("{v:.2}"));
-                        send!(l, "setStringValue:", t.0 as Id => Id; -> ());
-                    }
+            let Some(n) = PARAM_NAMES.get(idx) else { return };
+            let _ = ui.pipe.params.set(n, v);
+            if let Some(&(_, l)) = ui.c.sliders.get(idx) {
+                if !l.is_null() {
+                    set_text(l, &format_builtin(n, v));
                 }
-                ui.dirty = true;
             }
+            ui.refresh_preset_choice();
+            ui.dirty = true;
         });
     }
 }
 
 extern "C" fn on_select_au_preset(_: Id, _: Sel, sender: Id) {
-    let num = unsafe { tag_of(sender) } as i32;
-    with_ui(|ui| {
-        if let Some(a) = ui.pipe.au() {
-            let r = a.handle().set_preset(num);
-            log(&format!("set AU preset #{num}: {r:?}"));
-            if r.is_ok() {
-                ui.cfg.au_preset = ui
-                    .au_presets
-                    .iter()
-                    .find(|p| p.0 == num)
-                    .map(|p| p.1.clone());
-                ui.au_modified = false;
-                ui.save();
-                ui.pipe.save_au_state();
-            }
-        }
-    });
-}
+    let Some(tag) = (unsafe { selected_tag(sender) }) else {
+        return;
+    };
+    with_ui(|ui| unsafe {
+        let Some(a) = ui.pipe.au() else { return };
+        let h = a.handle();
 
-extern "C" fn on_select_au_user_preset(_: Id, _: Sel, sender: Id) {
-    let idx = unsafe { tag_of(sender) } as usize;
-    with_ui(|ui| {
-        let Some((name, path)) = ui.au_user_presets.get(idx).cloned() else {
+        let (name, r) = if tag >= FACTORY_BASE {
+            let num = (tag - FACTORY_BASE) as i32;
+            let name = ui.au_presets.iter().find(|p| p.0 == num).map(|p| p.1.clone());
+            (name, h.set_preset(num))
+        } else if let Some((name, path)) = ui.au_user_presets.get(tag as usize).cloned() {
+            let r = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| h.load_state(&b));
+            (Some(name), r)
+        } else {
+            ui.refresh_au_preset();
             return;
         };
-        let Some(a) = ui.pipe.au() else { return };
-        let r = std::fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|b| a.handle().load_state(&b));
-        log(&format!("load user preset {name}: {r:?}"));
+        log(&format!("load AU preset {name:?}: {r:?}"));
+
         if r.is_ok() {
-            ui.cfg.au_preset = Some(name);
+            ui.cfg.au_preset = name;
             ui.au_modified = false;
             ui.save();
             ui.pipe.save_au_state();
         }
+        ui.refresh_au();
     });
+}
+
+/// After a parameter edit: mark the preset as edited.
+unsafe fn au_edited(ui: &mut Ui) {
+    if !ui.au_modified {
+        ui.au_modified = true;
+        ui.refresh_au_preset();
+    }
 }
 
 extern "C" fn on_au_slider(_: Id, _: Sel, sender: Id) {
@@ -927,55 +1580,49 @@ extern "C" fn on_au_slider(_: Id, _: Sel, sender: Id) {
                 return;
             };
             let _ = a.handle().set_param(p.id, v);
-            if let Some(&l) = ui.au_value_labels.get(idx) {
-                if !l.is_null() {
-                    let t = ns(&p.format(v));
-                    send!(l, "setStringValue:", t.0 as Id => Id; -> ());
-                }
+            if let Some(row) = ui.c.au_rows.get(idx) {
+                set_text(row.value, &p.format(v));
             }
-            ui.au_modified = true;
+            au_edited(ui);
         });
     }
 }
 
 extern "C" fn on_au_toggle(_: Id, _: Sel, sender: Id) {
-    let idx = unsafe { tag_of(sender) } as usize;
-    with_ui(|ui| {
+    let (idx, on) = unsafe { (tag_of(sender) as usize, send!(sender, "state"; -> isize) != 0) };
+    with_ui(|ui| unsafe {
         let (Some(p), Some(a)) = (ui.au_params.get(idx).cloned(), ui.pipe.au()) else {
             return;
         };
-        let h = a.handle();
-        let v = if h.get_param(p.id) >= 0.5 {
-            p.min
-        } else {
-            p.max
-        };
-        let _ = h.set_param(p.id, v);
-        ui.au_modified = true;
+        let _ = a.handle().set_param(p.id, if on { p.max } else { p.min });
+        au_edited(ui);
     });
 }
 
 extern "C" fn on_au_index(_: Id, _: Sel, sender: Id) {
-    let tag = unsafe { tag_of(sender) };
-    let (idx, k) = ((tag >> 16) as usize, (tag & 0xffff) as f32);
-    with_ui(|ui| {
+    let (idx, k) = unsafe {
+        let k = selected_tag(sender).unwrap_or(0);
+        (tag_of(sender) as usize, k as f32)
+    };
+    with_ui(|ui| unsafe {
         let (Some(p), Some(a)) = (ui.au_params.get(idx).cloned(), ui.pipe.au()) else {
             return;
         };
         let _ = a.handle().set_param(p.id, p.min.round() + k);
-        ui.au_modified = true;
+        au_edited(ui);
     });
 }
 
 extern "C" fn on_save_preset(_: Id, _: Sel, _: Id) {
-    with_ui(|ui| {
+    with_ui(|ui| unsafe {
         let Some(name) = ui.cfg.au_preset.clone() else {
             return;
         };
         let r = ui.write_preset(&name);
         log(&format!("save preset {name}: {r:?}"));
-        if let Err(e) = r {
-            unsafe { notify_error("Could not save preset", &e) };
+        match r {
+            Ok(()) => ui.refresh_au_preset(),
+            Err(e) => notify_error("Не удалось сохранить пресет", &e),
         }
     });
 }
@@ -989,31 +1636,34 @@ extern "C" fn on_save_preset_as(_: Id, _: Sel, _: Id) {
             .au_preset
             .as_ref()
             .map(|n| format!("{n} 2"))
-            .unwrap_or_else(|| "My Preset".into());
+            .unwrap_or_else(|| "Мой пресет".into());
         let Some(name) = prompt(
-            "Save Plugin Preset",
+            "Сохранить пресет плагина",
             &format!(
-                "Saved to {} — also visible in the plugin, Logic and GarageBand.",
+                "Файл ляжет в {} — его увидят и сам плагин, Logic и GarageBand.",
                 dir.display()
             ),
             &default,
-            "Save",
+            "Сохранить",
         ) else {
             return;
         };
+
         if dir.join(format!("{name}.aupreset")).exists()
             && !confirm(
-                &format!("Replace \u{201c}{name}\u{201d}?"),
-                "A preset with this name already exists.",
-                "Replace",
+                &format!("Заменить \u{201c}{name}\u{201d}?"),
+                "Пресет с таким именем уже есть.",
+                "Заменить",
             )
         {
             return;
         }
+
         let r = ui.write_preset(&name);
         log(&format!("save preset as {name}: {r:?}"));
-        if let Err(e) = r {
-            notify_error("Could not save preset", &e);
+        match r {
+            Ok(()) => ui.schedule_rebuild(),
+            Err(e) => notify_error("Не удалось сохранить пресет", &e),
         }
     });
 }
@@ -1027,25 +1677,27 @@ extern "C" fn on_delete_preset(_: Id, _: Sel, _: Id) {
             return;
         };
         if !confirm(
-            &format!("Delete preset \u{201c}{name}\u{201d}?"),
-            "The file will be moved to the Trash.",
-            "Move to Trash",
+            &format!("Удалить пресет \u{201c}{name}\u{201d}?"),
+            "Файл будет перемещён в Корзину.",
+            "В Корзину",
         ) {
             return;
         }
+
         let ok = trash(&path);
         log(&format!("delete preset {name}: {ok}"));
         if ok {
             ui.cfg.au_preset = None;
             ui.save();
+            ui.schedule_rebuild();
         } else {
-            notify_error("Could not delete preset", &path.display().to_string());
+            notify_error("Не удалось удалить пресет", &path.display().to_string());
         }
     });
 }
 
 extern "C" fn on_open_plugin_ui(_: Id, _: Sel, _: Id) {
-    log("menu: Open Plugin Window");
+    log("open plugin window");
     with_ui(|ui| unsafe { ui.open_plugin_window() });
 }
 
@@ -1062,26 +1714,29 @@ extern "C" fn on_quit(_: Id, _: Sel, _: Id) {
     terminate();
 }
 
-extern "C" fn on_menu_needs_update(_: Id, _: Sel, menu: Id) {
-    with_ui(|ui| unsafe { ui.populate(menu) });
-}
-
 extern "C" fn on_tick(_: Id, _: Sel, _: Id) {
     if TERMINATE.load(Relaxed) {
         terminate();
         return;
     }
-    with_ui(|ui| {
+    with_ui(|ui| unsafe {
         ui.ticks += 1;
         if ui.pipe.needs_rebuild(&ui.cfg) {
+            let had_au = ui.pipe.au().is_some();
             ui.apply();
+            if ui.popover_shown() && ui.pipe.au().is_some() != had_au {
+                ui.schedule_rebuild();
+            }
         } else if ui.dirty {
             ui.save();
         }
         if ui.ticks % 15 == 0 {
             ui.pipe.save_au_state();
         }
-        unsafe { ui.update_icon() };
+        ui.update_icon();
+        if ui.popover_shown() {
+            ui.refresh_header();
+        }
     });
 }
 
@@ -1091,17 +1746,25 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 unsafe fn make_controller() -> Id {
     let cls = objc_allocateClassPair(class(c"NSObject"), c"VinylizerController".as_ptr(), 0);
-    let methods: [(&CStr, extern "C" fn(Id, Sel, Id)); 19] = [
+    let methods: &[(&CStr, extern "C" fn(Id, Sel, Id))] = &[
+        (c"togglePopover:", on_toggle_popover),
+        (c"popoverDidClose:", on_popover_closed),
+        (c"rebuild:", on_rebuild),
         (c"toggleEnabled:", on_toggle_enabled),
         (c"selectTarget:", on_select_target),
+        (c"selectMode:", on_select_mode),
         (c"selectEffect:", on_select_effect),
-        (c"toggleChain:", on_toggle_chain),
         (c"toggleBypass:", on_toggle_bypass),
         (c"selectPreset:", on_select_preset),
+        (c"saveBuiltinPreset:", on_save_builtin_preset),
+        (c"saveBuiltinPresetAs:", on_save_builtin_preset_as),
+        (c"deleteBuiltinPreset:", on_delete_builtin_preset),
+        (c"resetBuiltin:", on_reset_builtin),
+        (c"resetPlugin:", on_reset_plugin),
+        (c"selectRpm:", on_select_rpm),
         (c"sliderChanged:", on_slider),
         (c"openPluginUI:", on_open_plugin_ui),
         (c"selectAuPreset:", on_select_au_preset),
-        (c"selectAuUserPreset:", on_select_au_user_preset),
         (c"auSliderChanged:", on_au_slider),
         (c"auToggle:", on_au_toggle),
         (c"auIndex:", on_au_index),
@@ -1109,18 +1772,72 @@ unsafe fn make_controller() -> Id {
         (c"savePresetAs:", on_save_preset_as),
         (c"deletePreset:", on_delete_preset),
         (c"quit:", on_quit),
-        (c"menuNeedsUpdate:", on_menu_needs_update),
         (c"tick:", on_tick),
     ];
     for (name, f) in methods {
-        class_addMethod(cls, sel(name), f as *const c_void, c"v@:@".as_ptr());
+        class_addMethod(cls, sel(name), *f as *const c_void, c"v@:@".as_ptr());
     }
-    let proto = objc_getProtocol(c"NSMenuDelegate".as_ptr());
+    let proto = objc_getProtocol(c"NSPopoverDelegate".as_ptr());
     if !proto.is_null() {
         class_addProtocol(cls, proto);
     }
     objc_registerClassPair(cls);
     send!(send!(cls, "alloc"; -> Id), "init"; -> Id)
+}
+
+/// NSView with a top-left origin, so rows can be laid out downwards.
+unsafe fn make_flipped_view_class() -> Id {
+    let cls = objc_allocateClassPair(class(c"NSView"), c"VinylizerFlippedView".as_ptr(), 0);
+    class_addMethod(cls, sel(c"isFlipped"), is_flipped as *const c_void, BOOL_RET_TYPES.as_ptr());
+    objc_registerClassPair(cls);
+    cls
+}
+
+/// Transient popover: closes when the user clicks anywhere outside it.
+unsafe fn make_popover(delegate: Id) -> (Id, Id) {
+    let scroll = send!(class(c"NSScrollView"), "alloc"; -> Id);
+    let scroll = send!(scroll, "initWithFrame:", NSRect::new(0.0, 0.0, W, 300.0) => NSRect; -> Id);
+    send!(scroll, "setHasVerticalScroller:", YES => ObjcBool; -> ());
+    send!(scroll, "setAutohidesScrollers:", YES => ObjcBool; -> ());
+    send!(scroll, "setDrawsBackground:", NO => ObjcBool; -> ());
+    send!(scroll, "setBorderType:", 0usize => usize; -> ());
+
+    let vc = send!(send!(class(c"NSViewController"), "alloc"; -> Id), "init"; -> Id);
+    send!(vc, "setView:", scroll => Id; -> ());
+    send!(scroll, "release"; -> ());
+
+    let popover = send!(send!(class(c"NSPopover"), "alloc"; -> Id), "init"; -> Id);
+    send!(popover, "setBehavior:", 1isize => isize; -> ()); // transient
+    send!(popover, "setContentViewController:", vc => Id; -> ());
+    send!(vc, "release"; -> ());
+    send!(popover, "setDelegate:", delegate => Id; -> ());
+    (popover, scroll)
+}
+
+/// Dev aid: `VINYLIZER_SNAPSHOT=<dir>` renders the popover content in both modes to
+/// `<dir>/builtin.png` and `<dir>/plugin.png`, then exits. Settings are not saved.
+unsafe fn snapshot(ui: &mut Ui, dir: &str) {
+    for (mode, name) in [(Mode::Builtin, "builtin"), (Mode::Plugin, "plugin")] {
+        ui.cfg.mode = mode;
+        ui.cfg.enabled = true;
+        let _ = ui.pipe.apply(&ui.cfg);
+
+        let h = ui.rebuild();
+        let doc = send!(ui.scroll, "documentView"; -> Id);
+        // Light appearance, so labels are visible on the transparent PNG.
+        let aqua = ns("NSAppearanceNameAqua");
+        let appearance = send!(class(c"NSAppearance"), "appearanceNamed:", aqua.0 as Id => Id; -> Id);
+        send!(doc, "setAppearance:", appearance => Id; -> ());
+        let rect = NSRect::new(0.0, 0.0, W, h);
+        let rep = send!(doc, "bitmapImageRepForCachingDisplayInRect:", rect => NSRect; -> Id);
+        send!(doc, "cacheDisplayInRect:toBitmapImageRep:", rect => NSRect, rep => Id; -> ());
+
+        let props = send!(class(c"NSDictionary"), "dictionary"; -> Id);
+        let png = send!(rep, "representationUsingType:properties:", 4usize => usize, props => Id; -> Id);
+        let path = ns(&format!("{dir}/{name}.png"));
+        let ok = send!(png, "writeToFile:atomically:", path.0 as Id => Id, YES => ObjcBool; -> ObjcBool);
+        eprintln!("snapshot {name}: {} ({h} pt)", ok == YES);
+    }
 }
 
 pub fn run() {
@@ -1137,9 +1854,13 @@ pub fn run() {
         send!(app, "setActivationPolicy:", 1isize => isize; -> ObjcBool); // accessory: no Dock icon
 
         let controller = make_controller();
+        let flipped = make_flipped_view_class();
+        let (popover, scroll) = make_popover(controller);
         let params = Arc::new(Params::new());
         let cfg_path = support_dir().join("settings.txt");
-        let cfg = Settings::load(&cfg_path, &params);
+        let mut cfg = Settings::load(&cfg_path, &params);
+        // The UI offers exactly two modes; chaining stays a CLI option.
+        cfg.chain = false;
         let pipe = Pipeline::new(params);
 
         // Start near the clock (distance from the right edge, in points) unless the user
@@ -1168,9 +1889,8 @@ pub fn run() {
             let t = ns("◉");
             send!(button, "setTitle:", t.0 as Id => Id; -> ());
         }
-        let menu = new_menu("Vinylizer");
-        send!(menu, "setDelegate:", controller => Id; -> ());
-        send!(item, "setMenu:", menu => Id; -> ());
+        send!(button, "setTarget:", controller => Id; -> ());
+        send!(button, "setAction:", sel(c"togglePopover:") => Sel; -> ());
 
         log("--- Vinylizer started");
         let mut effects: Vec<String> = au::list_effects().into_iter().map(|c| c.name).collect();
@@ -1183,19 +1903,28 @@ pub fn run() {
             cfg,
             cfg_path,
             controller,
+            flipped,
             status_item: item,
+            popover,
+            scroll,
+            closed_at: None,
             effects,
             apps: Vec::new(),
-            value_labels: Vec::new(),
+            c: Controls::default(),
+            builtin_user: Vec::new(),
             plugin_window: ptr::null_mut(),
             au_presets: Vec::new(),
             au_user_presets: Vec::new(),
             au_params: Vec::new(),
-            au_value_labels: Vec::new(),
             au_modified: false,
             dirty: false,
             ticks: 0,
         };
+        if let Ok(dir) = std::env::var("VINYLIZER_SNAPSHOT") {
+            snapshot(&mut ui, &dir);
+            ui.pipe.stop();
+            return;
+        }
         ui.apply();
         UI.with(|cell| *cell.borrow_mut() = Some(ui));
 

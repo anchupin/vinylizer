@@ -35,34 +35,55 @@ impl AtomicF32 {
 #[derive(Debug)]
 pub struct Params {
     pub wet: AtomicF32,     // dry/wet mix
-    pub age: AtomicF32,     // HF roll-off + low-mid warmth
-    pub crackle: AtomicF32, // clicks & pops density/level
+    pub age: AtomicF32,     // record wear: HF roll-off + low-mid warmth
+    pub crackle: AtomicF32, // dust ticks, pops and per-revolution scratches
     pub wow: AtomicF32,     // wow/flutter depth
-    pub noise: AtomicF32,   // surface hiss + motor rumble
-    pub drive: AtomicF32,   // soft saturation
+    pub noise: AtomicF32,   // groove surface noise
+    pub drive: AtomicF32,   // stylus distortion (even-order, treble-weighted)
     pub width: AtomicF32,   // stereo width (0 = mono, 1 = original)
     pub gain: AtomicF32,    // output gain, linear (0..2)
+    pub rpm: AtomicF32,     // turntable speed index into `RPM_LABELS` (0..2)
     pub bypass: AtomicBool,
     version: AtomicU32,
 }
 
 pub const PARAM_NAMES: &[&str] = &[
-    "wet", "age", "crackle", "wow", "noise", "drive", "width", "gain",
+    "wet", "age", "crackle", "wow", "noise", "drive", "width", "gain", "rpm",
 ];
 
-pub const PRESETS: &[(&str, [f32; 8])] = &[
-    //            wet   age   crackle wow   noise drive width gain
-    ("subtle", [1.0, 0.30, 0.15, 0.15, 0.20, 0.20, 0.90, 1.0]),
-    ("warm", [1.0, 0.45, 0.25, 0.25, 0.30, 0.35, 0.85, 1.0]),
-    ("worn", [1.0, 0.60, 0.60, 0.40, 0.50, 0.45, 0.80, 1.0]),
-    ("shellac", [1.0, 0.95, 0.80, 0.50, 0.70, 0.60, 0.00, 1.1]),
+/// What each parameter is called in the UI and what it does, in the order of `PARAM_NAMES`.
+pub const PARAM_INFO: &[(&str, &str, &str)] = &[
+    ("wet", "Сила эффекта", "Сколько «пластинки» подмешано к оригиналу"),
+    ("age", "Износ пластинки", "Глушит верха: 0 — новая, 100% — заиграна"),
+    ("crackle", "Пыль и царапины", "Треск, щелчки и царапины, повторяющиеся каждый оборот"),
+    ("wow", "Плавание тона", "Неровный ход диска и биение пластинки"),
+    ("noise", "Шум поверхности", "Шорох канавки, «дышит» в такт обороту"),
+    ("drive", "Искажения иглы", "Тёплая грязь на громких местах и шипящих"),
+    ("width", "Ширина стерео", "0 — моно, как у 78-х; бас моно всегда"),
+    ("gain", "Громкость", "Итоговый уровень; 0 dB — без изменений"),
+    ("rpm", "Скорость", "Задаёт период щелчков и плавания"),
+];
+
+pub const RPM_LABELS: &[&str] = &["33⅓ об/мин", "45 об/мин", "78 об/мин"];
+
+/// What "reset" returns the built-in effect to.
+pub const DEFAULT_PRESET: &str = "warm";
+
+pub const PRESETS: &[(&str, &str, [f32; 9])] = &[
+    //                                  wet   age   crackle wow   noise drive width gain rpm
+    ("new", "Новая пластинка", [1.0, 0.15, 0.08, 0.10, 0.15, 0.20, 0.95, 1.0, 0.0]),
+    ("subtle", "Чуть-чуть", [1.0, 0.30, 0.15, 0.15, 0.20, 0.25, 0.90, 1.0, 0.0]),
+    ("warm", "Тёплая", [1.0, 0.45, 0.25, 0.25, 0.30, 0.35, 0.85, 1.0, 0.0]),
+    ("worn", "Заигранная", [1.0, 0.60, 0.60, 0.40, 0.50, 0.50, 0.80, 1.0, 0.0]),
+    ("single", "Сингл 45", [1.0, 0.35, 0.30, 0.20, 0.25, 0.40, 0.85, 1.0, 1.0]),
+    ("shellac", "Шеллак 78", [1.0, 0.95, 0.80, 0.50, 0.70, 0.60, 0.00, 1.1, 2.0]),
     // Derived from the user's iZotope Vinyl presets (Year / Wear / Dust / Scratch / Warp / Noise / Mono):
     // Jazz: 1950s, wear 25 %, dust 40 % loud, light scratches, no warp, quiet motor, stereo
-    ("jazz", [1.0, 0.40, 0.30, 0.05, 0.20, 0.25, 0.90, 1.0]),
+    ("jazz", "Джаз 50-х", [1.0, 0.40, 0.30, 0.05, 0.20, 0.25, 0.90, 1.0, 0.0]),
     // Sinatra 50s: 1950s, wear 30 %, softer dust, a touch more motor noise
-    ("sinatra", [1.0, 0.45, 0.22, 0.05, 0.25, 0.30, 0.85, 1.0]),
+    ("sinatra", "Синатра 50-х", [1.0, 0.45, 0.22, 0.05, 0.25, 0.30, 0.85, 1.0, 0.0]),
     // Old 78 Jazz: 1930s 78 rpm, wear 40 %, dust 50 %, more scratches, slight warp, mono
-    ("jazz78", [1.0, 0.90, 0.50, 0.15, 0.50, 0.45, 0.00, 1.05]),
+    ("jazz78", "Старый джаз 78", [1.0, 0.90, 0.50, 0.15, 0.50, 0.45, 0.00, 1.05, 2.0]),
 ];
 
 impl Params {
@@ -76,10 +97,11 @@ impl Params {
             drive: AtomicF32::new(0.0),
             width: AtomicF32::new(1.0),
             gain: AtomicF32::new(1.0),
+            rpm: AtomicF32::new(0.0),
             bypass: AtomicBool::new(false),
             version: AtomicU32::new(1),
         };
-        p.apply_preset("warm").expect("built-in preset");
+        p.apply_preset(DEFAULT_PRESET).expect("built-in preset");
         p
     }
 
@@ -93,6 +115,7 @@ impl Params {
             "drive" => &self.drive,
             "width" => &self.width,
             "gain" => &self.gain,
+            "rpm" => &self.rpm,
             _ => return None,
         })
     }
@@ -102,7 +125,6 @@ impl Params {
     }
 
     pub fn set(&self, name: &str, v: f32) -> Result<(), String> {
-        let max = if name == "gain" { 2.0 } else { 1.0 };
         let slot = self.slot(name).ok_or_else(|| {
             format!(
                 "unknown parameter '{name}' (have: {})",
@@ -112,13 +134,18 @@ impl Params {
         if !v.is_finite() {
             return Err("value must be a number".into());
         }
-        slot.set(v.clamp(0.0, max));
+        let v = match name {
+            "gain" => v.clamp(0.0, 2.0),
+            "rpm" => v.round().clamp(0.0, (RPM_LABELS.len() - 1) as f32),
+            _ => v.clamp(0.0, 1.0),
+        };
+        slot.set(v);
         self.version.fetch_add(1, Relaxed);
         Ok(())
     }
 
     pub fn apply_preset(&self, name: &str) -> Result<(), String> {
-        let (_, vals) = PRESETS.iter().find(|(n, _)| *n == name).ok_or_else(|| {
+        let (_, _, vals) = PRESETS.iter().find(|(n, _, _)| *n == name).ok_or_else(|| {
             format!(
                 "unknown preset '{name}' (have: {})",
                 PRESETS.iter().map(|p| p.0).collect::<Vec<_>>().join(", ")
@@ -128,6 +155,37 @@ impl Params {
             self.set(n, *v)?;
         }
         Ok(())
+    }
+
+    /// Index into `PRESETS` of the preset the current values match, if any.
+    pub fn matching_preset(&self) -> Option<usize> {
+        PRESETS.iter().position(|(_, _, vals)| self.matches(vals))
+    }
+
+    /// Whether the current values equal `vals` (in `PARAM_NAMES` order).
+    pub fn matches(&self, vals: &[f32]) -> bool {
+        vals.len() == PARAM_NAMES.len()
+            && PARAM_NAMES
+                .iter()
+                .zip(vals)
+                .all(|(n, v)| (self.get(n).unwrap() - v).abs() < 0.005)
+    }
+
+    /// Current values in `PARAM_NAMES` order.
+    pub fn values(&self) -> Vec<f32> {
+        PARAM_NAMES.iter().map(|n| self.get(n).unwrap()).collect()
+    }
+
+    /// Set every parameter from `vals` (in `PARAM_NAMES` order).
+    pub fn apply_values(&self, vals: &[f32]) {
+        for (n, v) in PARAM_NAMES.iter().zip(vals) {
+            let _ = self.set(n, *v);
+        }
+    }
+
+    /// Speed index into `RPM_LABELS`.
+    pub fn rpm_index(&self) -> usize {
+        self.rpm.get() as usize
     }
 
     #[inline]
@@ -167,6 +225,25 @@ mod tests {
         assert!(p.version() > v0);
         assert!(p.set("nope", 0.1).is_err());
         assert!(p.set("age", f32::NAN).is_err());
+        p.set("rpm", 1.4).unwrap();
+        assert_eq!(p.rpm_index(), 1);
+        p.set("rpm", 9.0).unwrap();
+        assert_eq!(p.rpm_index(), 2);
+    }
+
+    #[test]
+    fn presets_cover_every_param_and_match_back() {
+        assert_eq!(PARAM_INFO.len(), PARAM_NAMES.len());
+        for ((k, _, _), n) in PARAM_INFO.iter().zip(PARAM_NAMES) {
+            assert_eq!(k, n);
+        }
+        let p = Params::new();
+        for (i, (name, _, _)) in PRESETS.iter().enumerate() {
+            p.apply_preset(name).unwrap();
+            assert_eq!(p.matching_preset(), Some(i), "{name}");
+        }
+        p.set("crackle", 0.123).unwrap();
+        assert_eq!(p.matching_preset(), None);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::ffi::*;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
-use vinylizer::dsp::Vinyl;
+use vinylizer::dsp::{soft_clip, Vinyl};
 use vinylizer::params::{AtomicF32, Params};
 
 #[derive(Default)]
@@ -121,7 +121,11 @@ impl Engine {
         let mut in_peak = 0f32;
         let mut out_peak = 0f32;
         let mut write = |i: usize, l: f32, r: f32| {
-            let (l, r) = (l * gain, r * gain);
+            let (l, r) = if bypass {
+                (l, r)
+            } else {
+                (soft_clip(l * gain), soft_clip(r * gain))
+            };
             out_peak = out_peak.max(l.abs()).max(r.abs());
             if mono_out {
                 *d0.ptr.add(i * d0.stride) = 0.5 * (l + r);

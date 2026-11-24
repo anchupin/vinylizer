@@ -26,8 +26,10 @@ USAGE:
 CLI OPTIONS:
   --app <bundle>       process only apps whose bundle id starts with <bundle>, repeatable
                        (e.g. com.spotify.client); default: all system audio
-  --preset <name>      built-in preset: subtle | warm | worn | shellac | jazz | sinatra | jazz78  (default: warm)
-  --set <k>=<v>        override a built-in parameter, repeatable (wet age crackle wow noise drive width gain)
+  --preset <name>      built-in preset: new | subtle | warm | worn | single | shellac | jazz | sinatra | jazz78
+                       (default: warm)
+  --set <k>=<v>        override a built-in parameter, repeatable
+                       (wet age crackle wow noise drive width gain 0..2, rpm 0=33⅓ 1=45 2=78)
   --au <name>          host an Audio Unit effect instead of the built-in DSP (e.g. \"Vinyl\")
   --chain              with --au: run the built-in DSP after the AU as well
   --list-devices       list output devices
@@ -67,7 +69,10 @@ fn run_cli(args: &[String]) -> Result<(), String> {
             "--cli" => {}
             "--app" => cfg.targets.push(val("--app")?),
             "--preset" => params.apply_preset(&val("--preset")?)?,
-            "--au" => cfg.au = Some(val("--au")?),
+            "--au" => {
+                cfg.au = Some(val("--au")?);
+                cfg.mode = vinylizer::settings::Mode::Plugin;
+            }
             "--chain" => cfg.chain = true,
             "--set" => {
                 let s = val("--set")?;

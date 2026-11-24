@@ -63,7 +63,7 @@ impl Pipeline {
             meter: Arc::new(Meter::default()),
             au: None,
             route: None,
-            status: "Off".into(),
+            status: "Выключено".into(),
         }
     }
 
@@ -118,14 +118,14 @@ impl Pipeline {
         self.stop();
         let r = self.apply_inner(cfg);
         if let Err(e) = &r {
-            self.status = format!("Error: {e}");
+            self.status = format!("Ошибка: {e}");
         }
         r
     }
 
     fn apply_inner(&mut self, cfg: &Settings) -> Result<()> {
         if !cfg.enabled {
-            self.status = "Off".into();
+            self.status = "Выключено".into();
             return Ok(());
         }
         let out = hal::default_output()?;
@@ -139,10 +139,10 @@ impl Pipeline {
             if objs.is_empty() {
                 // AU may still be (re)opened so its window is usable while waiting.
                 self.sync_au(
-                    cfg.au.as_deref(),
+                    cfg.active_au(),
                     hal::sample_rate(out.id).unwrap_or(48_000.0),
                 )?;
-                self.status = "Waiting for selected apps to play…".into();
+                self.status = "Ждём, пока выбранные приложения заиграют…".into();
                 return Ok(());
             }
             (TapTarget::Processes(objs.clone()), objs)
@@ -153,7 +153,7 @@ impl Pipeline {
         let sample_rate = hal::sample_rate(agg.id)?;
         let buffer = hal::buffer_frames(agg.id).unwrap_or(512);
 
-        self.sync_au(cfg.au.as_deref(), sample_rate)?;
+        self.sync_au(cfg.active_au(), sample_rate)?;
         let au_ptr: *mut AuPlugin = self
             .au
             .as_deref_mut()
@@ -187,9 +187,9 @@ impl Pipeline {
         route.io = Some(io);
 
         let fx = match &self.au {
-            Some(a) if cfg.chain => format!("{} + built-in", a.name),
+            Some(a) if cfg.chain => format!("{} + Vinylizer", a.name),
             Some(a) => a.name.clone(),
-            None => "built-in".into(),
+            None => "Vinylizer".into(),
         };
         self.status = format!(
             "{fx} → {} · {:.0} kHz · {} fr",
