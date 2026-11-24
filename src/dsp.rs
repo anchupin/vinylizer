@@ -39,7 +39,7 @@ const MONO_BASS_HZ: f32 = 150.0;
 /// Measured RMS of the raw groove-noise generator (see `noise_generator_rms` test).
 const NOISE_GEN_RMS: f32 = 0.273;
 /// Output peak of the loudest dust tick per unit of click amplitude (see `tick_peak` test).
-const TICK_PEAK: f32 = 1.1;
+const TICK_PEAK: f32 = 0.94;
 
 const VOICES: usize = 16;
 const SCRATCHES: usize = 4;
@@ -198,6 +198,8 @@ struct Scratch {
     gr: f32,
     revs_left: u32,
     idle_revs: u32,
+    /// The first gap has been drawn; a fresh slot waits before its first scratch too.
+    armed: bool,
 }
 
 /// Groove noise colour: mostly low-mid "roar" with some hiss, nothing below 150 Hz.
@@ -241,6 +243,7 @@ struct Snapshot {
     wet: f32,
     age: f32,
     crackle: f32,
+    scratches: f32,
     crackle_level: f32,
     wow: f32,
     noise: f32,
@@ -281,6 +284,7 @@ pub struct Vinyl {
     tick_p: f32,
     pop_p: f32,
     fizz_p: f32,
+    fizz_lvl: f32,
     click_lvl: f32,
     density: f32,
     density_target: f32,
@@ -327,6 +331,7 @@ impl Vinyl {
             tick_p: 0.0,
             pop_p: 0.0,
             fizz_p: 0.0,
+            fizz_lvl: 0.0,
             click_lvl: 0.0,
             density: 1.0,
             density_target: 1.0,
@@ -355,6 +360,7 @@ impl Vinyl {
             wet: params.wet.get(),
             age: params.age.get(),
             crackle: params.crackle.get(),
+            scratches: params.scratches.get(),
             crackle_level: params.crackle_level.get(),
             wow: params.wow.get(),
             noise: params.noise.get(),
@@ -395,22 +401,30 @@ impl Vinyl {
         self.sat_inv_k = 1.0 / self.sat_k;
         self.sat_c2 = 0.14 * p.drive * (1.0 + p.age);
 
-        // Crackle amount sets how many: ticks up to ~25/s, pops up to ~0.4/s, dense quiet fizz,
-        // 0..4 scratches. Crackle level alone sets how loud: the loudest dust ticks peak there,
-        // most are up to 30 dB quieter, pops and scratches up to ~6 dB louder.
+        // Dust sets how many ticks (up to ~25/s), pops (up to ~0.4/s) and quiet fizz; scratches
+        // set how many scratch slots (0..4) and how often they show up. Crackle level alone sets
+        // how loud: the loudest dust ticks peak there, most are up to 30 dB quieter, pops and
+        // scratches up to ~6 dB louder.
         let c = p.crackle;
         self.tick_p = (c.powf(1.5) * 25.0) / fs;
         self.pop_p = (c * 0.4) / fs;
         self.fizz_p = (c * 300.0) / fs;
-        self.n_scratches = ((c * SCRATCHES as f32).round() as usize).min(SCRATCHES);
+        self.n_scratches = if p.scratches > 0.0 {
+            ((p.scratches * SCRATCHES as f32).round() as usize).clamp(1, SCRATCHES)
+        } else {
+            0
+        };
         self.click_lvl = 10f32.powf(crackle_peak_db(p.crackle_level) / 20.0) / TICK_PEAK;
 
         // Groove noise from about -72 dBFS RMS (new record) to -42 dBFS (worn out).
-        self.noise_lvl = if p.noise > 0.0 {
-            10f32.powf((-72.0 + 30.0 * p.noise) / 20.0) / NOISE_GEN_RMS
+        // Fizz peaks a little above the noise it belongs to.
+        let noise_rms = if p.noise > 0.0 {
+            10f32.powf((-72.0 + 30.0 * p.noise) / 20.0)
         } else {
             0.0
         };
+        self.noise_lvl = noise_rms / NOISE_GEN_RMS;
+        self.fizz_lvl = noise_rms * 4.0;
     }
 
     #[inline(always)]
@@ -474,7 +488,7 @@ impl Vinyl {
     fn on_revolution(&mut self) {
         for i in 0..SCRATCHES {
             if i >= self.n_scratches {
-                self.scratches[i].revs_left = 0;
+                self.scratches[i] = Scratch::default();
                 continue;
             }
 
@@ -482,23 +496,34 @@ impl Vinyl {
             if s.revs_left > 0 {
                 self.scratches[i].revs_left -= 1;
                 if s.revs_left == 1 {
-                    self.scratches[i].idle_revs = 2 + (self.rand() * 10.0) as u32;
+                    self.scratches[i].idle_revs = self.scratch_gap_revs();
                 }
+            } else if !s.armed {
+                self.scratches[i].idle_revs = self.scratch_gap_revs();
+                self.scratches[i].armed = true;
             } else if s.idle_revs > 0 {
                 self.scratches[i].idle_revs -= 1;
             } else {
                 let (gl, gr) = self.random_gains(0.7);
                 self.scratches[i] = Scratch {
                     angle: self.rand(),
-                    amp: 0.5 + 0.7 * self.rand(),
-                    freq: 700.0 + 1_800.0 * self.rand(),
+                    amp: 0.4 + 0.5 * self.rand(),
+                    freq: 1_200.0 + 2_800.0 * self.rand(),
                     gl,
                     gr,
-                    revs_left: 6 + (self.rand() * 30.0) as u32,
+                    revs_left: 6 + (self.rand() * 24.0) as u32,
                     idle_revs: 0,
+                    armed: true,
                 };
             }
         }
+    }
+
+    /// Revolutions until a scratch slot plays again: 5–40 s on a badly scratched record,
+    /// up to about two minutes on a lightly scratched one.
+    fn scratch_gap_revs(&mut self) -> u32 {
+        let secs = (5.0 + 35.0 * self.rand()) * (1.0 + 3.0 * (1.0 - self.p.scratches));
+        (secs * ROTATION_HZ[self.p.rpm]) as u32
     }
 
     /// Returns (left, right) crackle contribution. `prev` is the rotation phase before this sample.
@@ -517,9 +542,12 @@ impl Vinyl {
                 s.angle > prev || s.angle <= cur
             };
             if s.revs_left > 0 && crossed && self.rand() < 0.93 {
+                // The stylus jumping the scratch edge: a sharp tick, then the dull "tock" that
+                // RIAA playback EQ makes of it by lifting the bass. The tock dies out within about
+                // half a cycle, so it thuds instead of ringing into a pitched "bloop".
                 let a = lvl * s.amp * (0.75 + 0.5 * self.rand());
-                self.trigger(a, s.freq * 0.85, s.freq * 1.15, 0.00015, 0.0004, s.gl, s.gr);
-                self.trigger(a * 0.5, 160.0, 320.0, 0.001, 0.002, s.gl, s.gr);
+                self.trigger(a, s.freq * 0.85, s.freq * 1.15, 0.00008, 0.0002, s.gl, s.gr);
+                self.trigger(a * 0.5, 150.0, 300.0, 0.0007, 0.0014, s.gl, s.gr);
             }
         }
 
@@ -530,18 +558,20 @@ impl Vinyl {
         self.density += (self.density_target - self.density) * 1.0e-5;
         let dn = self.density;
 
+        // Dust ticks barely ring (about one cycle), so they click rather than "plip".
         let u = self.rand();
         if u < self.pop_p * dn {
             let a = lvl * (1.0 + self.rand());
             let (gl, gr) = self.random_gains(0.2);
-            self.trigger(a, 250.0, 900.0, 0.0006, 0.0015, gl, gr);
+            self.trigger(a, 300.0, 1_000.0, 0.0004, 0.001, gl, gr);
         } else if u < (self.pop_p + self.tick_p) * dn {
             // log-distributed amplitude over ~30 dB: mostly faint, occasionally sharp
             let a = lvl * 10f32.powf(-1.5 * self.rand());
             let (gl, gr) = self.random_gains(0.6);
-            self.trigger(a, 1_800.0, 6_000.0, 0.00005, 0.0002, gl, gr);
+            self.trigger(a, 2_500.0, 8_000.0, 0.00003, 0.0001, gl, gr);
         } else if u < (self.pop_p + self.tick_p + self.fizz_p) * dn {
-            let a = lvl * 0.04 * self.rand();
+            // Fizz is surface texture: it sits at the groove-noise level, not the click level.
+            let a = self.fizz_lvl * self.rand();
             let (gl, gr) = self.random_gains(1.0);
             self.trigger(a, 3_000.0, 7_000.0, 0.00002, 0.00006, gl, gr);
         }
@@ -652,7 +682,7 @@ impl Vinyl {
         let (mut wl, mut wr) = (m + sd, m - sd);
 
         // --- surface
-        if p.crackle > 0.0 {
+        if p.crackle > 0.0 || p.scratches > 0.0 {
             let (cl, cr) = self.crackle(prev);
             wl += cl;
             wr += cr;
@@ -703,6 +733,7 @@ mod tests {
             ("wet", 1.0),
             ("age", 0.0),
             ("crackle", 0.0),
+            ("scratches", 0.0),
             ("noise", 0.0),
             ("wow", 0.0),
             ("drive", 0.0),
@@ -867,13 +898,20 @@ mod tests {
     #[test]
     fn scratches_repeat_every_revolution() {
         let fs = 48_000.0;
-        let p = clean(&[("crackle", 1.0)]);
+        let p = clean(&[("scratches", 0.25)]);
         let mut v = Vinyl::new(fs as f64);
         v.update(&p);
-        // Only scratches: no random dust.
-        v.tick_p = 0.0;
-        v.pop_p = 0.0;
-        v.fizz_p = 0.0;
+        // One scratch that is already there, so the test does not wait for the first gap.
+        v.scratches[0] = Scratch {
+            angle: 0.3,
+            amp: 0.8,
+            freq: 2_000.0,
+            gl: 1.0,
+            gr: 1.0,
+            revs_left: 1_000,
+            idle_revs: 0,
+            armed: true,
+        };
         let rev = (fs / ROTATION_HZ[0]) as usize;
         let out = run(&mut v, rev * 12, |_| 0.0);
         let env: Vec<f32> = out.iter().map(|(l, r)| l.abs() + r.abs()).collect();
@@ -885,6 +923,38 @@ mod tests {
         let (one, half) = (corr(rev), corr(rev / 2));
         assert!(one > 0.0, "scratches should fire");
         assert!(one > half * 5.0, "one rev {one} vs half {half}");
+    }
+
+    /// Share of revolutions in which a scratch is ticking, over ~4 hours of 33⅓ rpm.
+    fn scratch_share(amount: f32) -> f32 {
+        let mut v = Vinyl::new(48_000.0);
+        v.update(&clean(&[("scratches", amount)]));
+        let revs = 8_000;
+        let active = (0..revs)
+            .filter(|_| {
+                v.on_revolution();
+                v.scratches.iter().any(|s| s.revs_left > 0)
+            })
+            .count();
+        active as f32 / revs as f32
+    }
+
+    #[test]
+    fn scratches_are_occasional_and_follow_the_knob() {
+        let (none, light, heavy) = (scratch_share(0.0), scratch_share(0.25), scratch_share(1.0));
+        assert_eq!(none, 0.0);
+        assert!(light > 0.05 && light < 0.4, "light: scratch audible {light:.2} of the time");
+        assert!(heavy > light, "heavy {heavy:.2} vs light {light:.2}");
+    }
+
+    #[test]
+    fn dust_alone_makes_no_scratches() {
+        let mut v = Vinyl::new(48_000.0);
+        v.update(&clean(&[("crackle", 1.0)]));
+        for _ in 0..1_000 {
+            v.on_revolution();
+        }
+        assert!(v.scratches.iter().all(|s| s.revs_left == 0));
     }
 
     #[test]
